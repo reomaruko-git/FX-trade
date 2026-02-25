@@ -1,0 +1,8 @@
+# 秘密情報 - 絶対にコミットしない
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
