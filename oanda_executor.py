@@ -18,10 +18,12 @@ import os
 import logging
 from dotenv import load_dotenv
 
+import pandas as pd
 import oandapyV20
-import oandapyV20.endpoints.orders    as orders
-import oandapyV20.endpoints.positions as pos_ep
-import oandapyV20.endpoints.trades    as trades_ep
+import oandapyV20.endpoints.orders      as orders
+import oandapyV20.endpoints.positions   as pos_ep
+import oandapyV20.endpoints.trades      as trades_ep
+import oandapyV20.endpoints.instruments as instr_ep
 from oandapyV20.contrib.requests import (
     MarketOrderRequest,
     TakeProfitDetails,
@@ -218,6 +220,61 @@ class OandaExecutor:
                 logger.info(f"[OANDA] tradeID取得: {instrument} → {trade_id}")
                 return trade_id
         return None
+
+    # ──────────────────────────────────────────────────────────
+    # ローソク足取得（リアルタイム価格データ）
+    # ──────────────────────────────────────────────────────────
+    def get_candles(
+        self,
+        instrument: str,
+        granularity: str = "H1",
+        count: int = 10,
+        include_incomplete: bool = False,
+    ) -> pd.DataFrame:
+        """
+        OANDA から OHLCV ローソク足を取得し DataFrame で返す。
+
+        Parameters
+        ----------
+        instrument         : 通貨ペア（例: "USD_JPY"）
+        granularity        : 時間軸（"H1", "H4", "D" 等）
+        count              : 取得本数（最大 5000）
+        include_incomplete : 最新の未確定足を含めるか
+                             True  → 現在価格取得（H1 等）
+                             False → 確定足のみ（H&S 検出・SMA 計算用）
+
+        Returns
+        -------
+        pd.DataFrame  columns: Open, High, Low, Close, Volume
+                      index  : DatetimeIndex（UTC）
+        """
+        r = instr_ep.InstrumentsCandles(
+            instrument,
+            params={"count": count, "granularity": granularity, "price": "M"},
+        )
+        self.client.request(r)
+
+        rows, timestamps = [], []
+        for c in r.response.get("candles", []):
+            if not include_incomplete and not c.get("complete", True):
+                continue   # 未確定足をスキップ
+            mid = c.get("mid", {})
+            rows.append({
+                "Open":   float(mid.get("o", 0)),
+                "High":   float(mid.get("h", 0)),
+                "Low":    float(mid.get("l", 0)),
+                "Close":  float(mid.get("c", 0)),
+                "Volume": int(c.get("volume", 0)),
+            })
+            timestamps.append(pd.Timestamp(c["time"]))
+
+        if not rows:
+            return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+        df = pd.DataFrame(rows)
+        df.index = pd.DatetimeIndex(timestamps, tz="UTC")
+        df.index.name = "Datetime"
+        return df
 
     # ──────────────────────────────────────────────────────────
     # ストップロス変更（建値移動）

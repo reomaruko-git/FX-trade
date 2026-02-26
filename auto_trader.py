@@ -294,8 +294,30 @@ def clear_position():
 # ─────────────────────────────────────────────────────────────
 # ▌ データ取得
 # ─────────────────────────────────────────────────────────────
-def fetch_data(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """yfinance から 1h / 4h 足を取得"""
+def fetch_data(ticker: str, pair_name: str = "") -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    価格データ取得。
+    OANDA 接続済み : oandapyV20 でリアルタイム取得（本番・DRY_RUN 共通）
+    OANDA 未接続   : yfinance でフォールバック（テスト・オフライン用）
+
+    H1 (10本)  → 現在価格取得用（include_incomplete=True で最新値を含む）
+    H4 (350本) → H&S 検出 + SMA200 計算用（確定足のみ）
+    """
+    # ── OANDA リアルタイム取得 ──────────────────────────────────
+    if OANDA_OK and pair_name:
+        instrument = pair_name.replace("/", "_")
+        try:
+            df_1h = oanda.get_candles(instrument, granularity="H1",
+                                      count=10, include_incomplete=True)
+            df_4h = oanda.get_candles(instrument, granularity="H4",
+                                      count=350, include_incomplete=False)
+            if not df_1h.empty and not df_4h.empty:
+                return df_1h, df_4h
+            logger.warning(f"[OANDA] {pair_name} ローソク足が空 — yfinance にフォールバック")
+        except Exception as e:
+            logger.warning(f"[OANDA] {pair_name} ローソク足取得失敗: {e} — yfinance にフォールバック")
+
+    # ── yfinance フォールバック ────────────────────────────────
     import yfinance as yf
     end   = datetime.now(tz=timezone.utc)
     start = end - timedelta(days=90)
@@ -909,7 +931,7 @@ def run():
                 pair_name = pos.get("pair", "USD/JPY")
                 ticker    = next((t for t, n in PAIRS.items() if n == pair_name), "USDJPY=X")
                 try:
-                    df_1h, _ = _with_retry(fetch_data, ticker,
+                    df_1h, _ = _with_retry(fetch_data, ticker, pair_name,
                                            label=f"fetch {pair_name}")
                     current_price = float(df_1h["Close"].iloc[-1])
                 except Exception as e:
@@ -955,7 +977,7 @@ def run():
             found_signal = False
             for ticker, pair_name in PAIRS.items():
                 try:
-                    df_1h, df_4h = _with_retry(fetch_data, ticker,
+                    df_1h, df_4h = _with_retry(fetch_data, ticker, pair_name,
                                                label=f"fetch {pair_name}")
                     current_price = float(df_1h["Close"].iloc[-1])
                     logger.info(f"{pair_name}: {current_price:.3f}")
