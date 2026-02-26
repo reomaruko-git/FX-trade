@@ -1,12 +1,12 @@
 {
-  "daily_pips": -4.1,
-  "daily_jpy": -41,
-  "weekly_pips": -4.1,
-  "weekly_jpy": -41,
-  "weekly_trades": 2,
-  "weekly_wins": 1,
-  "total_pips": -4.1,
-  "balance": 999959,
-  "last_date": "2026-02-25",
+  "daily_pips": 0.0,
+  "daily_jpy": 0,
+  "weekly_pips": 0.0,
+  "weekly_jpy": 0,
+  "weekly_trades": 0,
+  "weekly_wins": 0,
+  "total_pips": 0.0,
+  "balance": 500000,
+  "last_date": "2026-02-26",
   "last_week": "2026-W09"
 }

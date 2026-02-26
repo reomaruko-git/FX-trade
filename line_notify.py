@@ -144,6 +144,7 @@ def notify_entry(
         f"{icon} {label}エントリー！！ 🚀\n"
         f"ペア   : {flag} {pair}\n"
         f"レート : {price:.3f}\n"
+        f"ロット : {lot:,}通貨\n"
         f"────────────────────\n"
         f"💰 見込 : +{exp_jpy:,}円 (RR 1:{rr})\n"
         f"🛑 SL  : {stop_loss:.3f}  (-{sl_pips:.1f} pips)\n"
@@ -192,7 +193,7 @@ def notify_close(
     msg = (
         f"{header}\n"
         f"────────────────────\n"
-        f"{flag} {pair}  {dir_label}\n"
+        f"{flag} {pair}  {dir_label}  {lot:,}通貨\n"
         f"--------------------\n"
         f"🏁 決済 : {close_price:.3f}\n"
         f"🛫 始値 : {entry_price:.3f}\n"

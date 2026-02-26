@@ -1,15 +1,21 @@
 """
 auto_trader.py — FX Trade Luce 司令塔
 ==========================================
-H&S（4時間足）+ EMAクロス（1時間足）を監視し、
+H&S（4時間足）を3通貨ペアで監視し、
 シグナルが出たら LINE 通知 → OANDA 発注（または DRY RUN ログ）。
 
 戦略:
-  USD/JPY: H&S（4時間足）のみ
-           ※ USD/JPYはレンジ相場が多くEMAクロスが機能しにくいため廃止
-  GBP/JPY: EMAクロス（1時間足）+ ADXフィルター（ADX≥20）のみ
-           EMA12がEMA21を上抜け → BUY（SMA200より上のみ）
-           EMA12がEMA21を下抜け → SELL（SMA200より下のみ）
+  USD/JPY: H&S（4時間足）  バックテスト: 70回, 34.3%, +1333 pips
+  EUR/JPY: H&S（4時間足）  バックテスト: 64回, 28.1%, +1023 pips
+  AUD/JPY: H&S（4時間足）  バックテスト: 60回, 55.0%, +2895 pips
+  ※ GBP/JPY は成績不良（17.6%, -22pips）のため除外
+  ※ EMAクロスは廃止（過剰シグナル・低勝率のため）
+
+H&S検出: backtest.pyと同ロジック統一
+  - 直近100本窓・全組み合わせ探索（distance=5, tol=0.020）
+  - TP: ネックライン倍返し（head - neckline の距離をネックラインから延長）
+  - SL: 右肩高値（低値）+ 1pip バッファ
+  - MAX_SL_PIPS=80（4h足の自然なSL幅に対応）
 
 テクニカル計算: pandas_ta
 H&S検知      : scipy.signal.find_peaks
@@ -80,27 +86,25 @@ MAX_RETRY     = int(os.environ.get("MAX_RETRY", "3"))
 SMA_PERIOD    = int(os.environ.get("SMA_PERIOD", "200"))
 
 # 監視ペア: yfinance ticker → 表示名
+# ※ GBP/JPY は除外（バックテスト: 17.6%勝率, -22pips で成績不良）
 PAIRS = {
     "USDJPY=X": "USD/JPY",
-    "GBPJPY=X": "GBP/JPY",
     "EURJPY=X": "EUR/JPY",
     "AUDJPY=X": "AUD/JPY",
 }
 
-# EMAクロス 設定
-EMA_FAST   = 12    # 短期EMA
-EMA_SLOW   = 21    # 中期EMA
-ADX_PERIOD = 14    # ADX 計算期間
-ADX_MIN    = 15    # これ以上のADX値（トレンド相場）のみエントリー
-MAX_POSITIONS = 2  # 最大同時保有ポジション数
+# H&S 戦略パラメータ（backtest.pyと同値）
+HS_DISTANCE    = 5      # find_peaks の distance
+HS_TOL         = 0.020  # 肩の対称性許容誤差（感度テストで最適化済み）
+HS_BUFFER_PIPS = 0.05   # H&S 右肩からのバッファ距離（5pips）
+ADX_PERIOD     = 14     # ADX 計算期間（参考情報としてログ出力）
+MAX_POSITIONS  = 2      # 最大同時保有ポジション数
 
 # ── SL / TP ──────────────────────────────────────────────────
-SL_MULT        = 2.0   # SL = エントリー ± ATR × SL_MULT
-TP_MULT        = 4.0   # TP = エントリー ∓ ATR × TP_MULT (RR 1:2)
-HS_BUFFER_PIPS = 0.05  # H&S 右肩からのバッファ距離（5pips）
-HS_RR          = 2.0   # H&S リスクリワード比
-BREAKEVEN_PIPS = 20    # 建値移動トリガー
-MAX_SL_PIPS    = 50    # SL上限（pips）。これを超えるシグナルはスキップ
+# EMA用（互換性のため残す）
+SL_MULT        = 2.0
+TP_MULT        = 4.0
+MAX_SL_PIPS    = 80    # SL上限（pips）。50→80に拡張（4h足基準に合わせる）
 
 # ─────────────────────────────────────────────────────────────
 # ▌ ロガー
@@ -340,58 +344,66 @@ def calc_sma200(df: pd.DataFrame, period: int = SMA_PERIOD) -> float:
 
 
 # ─────────────────────────────────────────────────────────────
-# ▌ H&S パターン検知（scipy.signal.find_peaks 使用）
+# ▌ H&S パターン検知（backtest.py と完全統一ロジック）
 # ─────────────────────────────────────────────────────────────
-def detect_hs(df: pd.DataFrame, distance: int = 5, tol: float = 0.015) -> dict | None:
+def detect_hs(df: pd.DataFrame,
+              distance: int = HS_DISTANCE,
+              tol: float = HS_TOL) -> dict | None:
     """
-    scipy.signal.find_peaks でH&Sパターンを検知する。
+    直近100本窓・全組み合わせ探索でH&Sパターンを検知する。
+    backtest.py の detect_hs_at と同ロジック。
 
     戻り値:
         {
           "pattern":             "HEAD_AND_SHOULDERS" | "INV_HEAD_AND_SHOULDERS",
           "right_shoulder_high": float,
-          "right_shoulder_low":  float,
+          "right_shoulder_low":  float,   # INV_H&S のみ
           "head":                float,
           "neckline":            float,
         }
         or None
     """
-    if len(df) < distance * 6:
+    # 直近100本を使用（backtest.pyと同じ窓サイズ）
+    window = df.tail(100)
+    if len(window) < distance * 3:
         return None
 
-    highs = df["High"].values
-    lows  = df["Low"].values
+    highs = window["High"].values
+    lows  = window["Low"].values
+    n     = len(highs)
 
     # ── 天井 H&S（3つのピーク：左肩 < 頭 > 右肩、左肩 ≈ 右肩） ─────
     peak_idx, _ = find_peaks(highs, distance=distance)
     if len(peak_idx) >= 3:
-        ls_i, hd_i, rs_i = int(peak_idx[-3]), int(peak_idx[-2]), int(peak_idx[-1])
-        ls   = highs[ls_i]
-        head = highs[hd_i]
-        rs   = highs[rs_i]
+        # 全組み合わせを新しい順に探索（backtest.pyと同じ）
+        for k in range(len(peak_idx) - 3, -1, -1):
+            ls_i = int(peak_idx[k])
+            hd_i = int(peak_idx[k + 1])
+            rs_i = int(peak_idx[k + 2])
+            ls, head, rs = highs[ls_i], highs[hd_i], highs[rs_i]
 
-        # 右肩が直近 distance*3 本以内にあるか確認（古いパターンを除外）
-        min_rs_idx = len(highs) - distance * 3
-        if rs_i < min_rs_idx:
-            return None
+            # 右肩が古すぎる場合はスキップ
+            if rs_i < n - distance * 4:
+                continue
+            # 頭が両肩より高くないとNG
+            if head <= max(ls, rs):
+                continue
+            # 肩の対称性チェック
+            if abs(ls - rs) / (head + 1e-9) > tol:
+                continue
 
-        shoulders_similar = abs(ls - rs) / (head + 1e-9) < tol
-        head_dominant     = head > max(ls, rs) * (1 + tol * 0.5)
-
-        if shoulders_similar and head_dominant:
             # ネックライン: 左肩〜頭、頭〜右肩 間の最安値の平均
             neck1    = float(lows[ls_i:hd_i].min()) if hd_i > ls_i else float(lows[ls_i])
             neck2    = float(lows[hd_i:rs_i].min()) if rs_i > hd_i else float(lows[hd_i])
             neckline = round((neck1 + neck2) / 2, 3)
 
-            # 右肩の安値（右肩ピーク周辺の最安値）
+            # 右肩の高値（ピーク周辺の最高値）
             buf      = max(1, distance // 2)
-            rs_low   = float(lows[max(0, rs_i - buf): rs_i + buf + 1].min())
+            rs_high  = float(highs[max(0, rs_i - buf): rs_i + buf + 1].max())
 
             return {
                 "pattern":             "HEAD_AND_SHOULDERS",
-                "right_shoulder_high": float(rs),
-                "right_shoulder_low":  rs_low,
+                "right_shoulder_high": rs_high,
                 "head":                float(head),
                 "neckline":            neckline,
             }
@@ -399,31 +411,31 @@ def detect_hs(df: pd.DataFrame, distance: int = 5, tol: float = 0.015) -> dict |
     # ── 逆 H&S（3つのトラフ：左肩 > 頭 < 右肩、左肩 ≈ 右肩） ──────
     trough_idx, _ = find_peaks(-lows, distance=distance)
     if len(trough_idx) >= 3:
-        ls_i, hd_i, rs_i = int(trough_idx[-3]), int(trough_idx[-2]), int(trough_idx[-1])
-        ls   = lows[ls_i]
-        head = lows[hd_i]
-        rs   = lows[rs_i]
+        for k in range(len(trough_idx) - 3, -1, -1):
+            ls_i = int(trough_idx[k])
+            hd_i = int(trough_idx[k + 1])
+            rs_i = int(trough_idx[k + 2])
+            ls, head, rs = lows[ls_i], lows[hd_i], lows[rs_i]
 
-        # 右肩が直近 distance*3 本以内にあるか確認（古いパターンを除外）
-        min_rs_idx = len(lows) - distance * 3
-        if rs_i < min_rs_idx:
-            return None
+            if rs_i < n - distance * 4:
+                continue
+            if head >= min(ls, rs):
+                continue
+            if abs(ls - rs) / (abs(head) + 1e-9) > tol:
+                continue
 
-        shoulders_similar = abs(ls - rs) / (abs(head) + 1e-9) < tol
-        head_dominant     = head < min(ls, rs) * (1 - tol * 0.5)
-
-        if shoulders_similar and head_dominant:
             neck1    = float(highs[ls_i:hd_i].max()) if hd_i > ls_i else float(highs[ls_i])
             neck2    = float(highs[hd_i:rs_i].max()) if rs_i > hd_i else float(highs[hd_i])
             neckline = round((neck1 + neck2) / 2, 3)
 
             buf      = max(1, distance // 2)
-            rs_high  = float(highs[max(0, rs_i - buf): rs_i + buf + 1].max())
+            rs_low   = float(lows[max(0, rs_i - buf): rs_i + buf + 1].min())
+            rs_high  = float(highs[rs_i])
 
             return {
                 "pattern":             "INV_HEAD_AND_SHOULDERS",
                 "right_shoulder_high": rs_high,
-                "right_shoulder_low":  float(rs),
+                "right_shoulder_low":  rs_low,
                 "head":                float(head),
                 "neckline":            neckline,
             }
@@ -530,7 +542,9 @@ def check_ema_signal(df_1h: pd.DataFrame) -> dict | None:
 def check_hs_signal(df_4h: pd.DataFrame) -> dict | None:
     """
     H&S（4h）シグナルチェック。
-    SL/TP はテクニカル形状ベース、200SMAフィルター付き。
+    SL: 右肩高値（低値）+ 5pips バッファ
+    TP: ネックライン倍返し（backtest.py と統一）
+    フィルター: 200SMA（大局トレンド確認）
     """
     if len(df_4h) < 30:
         return None
@@ -554,15 +568,22 @@ def check_hs_signal(df_4h: pd.DataFrame) -> dict | None:
         neckline  = hs["neckline"]
         head_val  = hs["head"]
         sl        = round(rs_high + HS_BUFFER_PIPS, 3)
-        risk      = sl - close
-        sl_pips   = abs(risk) * 100
+        # SL方向チェック: SELLのSLはエントリーより上でなければならない
+        # 現在値が右肩より上にある場合 → パターンが古く逆方向SLになるのでスキップ
+        if sl <= close:
+            logger.info(f"[SL方向エラー] H&S/SELL SL({sl:.3f}) ≤ 現在値({close:.3f}) — パターン古いためスキップ")
+            return None
+        sl_pips   = abs(close - sl) * 100
         if sl_pips > MAX_SL_PIPS:
             logger.info(f"[SLキャップ] H&S/SELL SL={sl_pips:.1f}pips > 上限{MAX_SL_PIPS}pipsのためスキップ")
             return None
-        tp        = round(close - risk * HS_RR, 3)
-        neck_proj = round(neckline - (head_val - neckline), 3)
+        # TP: ネックライン倍返し（backtest.pyと統一）
+        depth     = head_val - neckline
+        tp        = round(neckline - depth, 3)
+        if tp >= close:
+            tp = round(close - sl_pips / 100 * 2, 3)   # フォールバック: RR 1:2
         sl_basis  = f"右肩高値({rs_high:.3f})+5pips"
-        tp_basis  = f"RR 1:{HS_RR:.0f} / ネックライン倍返し目安 {neck_proj:.3f}"
+        tp_basis  = f"ネックライン倍返し({neckline:.3f} - {depth:.3f} = {tp:.3f})"
         return {
             "action":      "SELL",
             "strategy":    "H&S 4h",
@@ -587,15 +608,22 @@ def check_hs_signal(df_4h: pd.DataFrame) -> dict | None:
         neckline  = hs["neckline"]
         head_val  = hs["head"]
         sl        = round(rs_low - HS_BUFFER_PIPS, 3)
-        risk      = close - sl
-        sl_pips   = abs(risk) * 100
+        # SL方向チェック: BUYのSLはエントリーより下でなければならない
+        # 現在値が右肩より下にある場合 → パターンが古く逆方向SLになるのでスキップ
+        if sl >= close:
+            logger.info(f"[SL方向エラー] 逆H&S/BUY SL({sl:.3f}) ≥ 現在値({close:.3f}) — パターン古いためスキップ")
+            return None
+        sl_pips   = abs(close - sl) * 100
         if sl_pips > MAX_SL_PIPS:
             logger.info(f"[SLキャップ] 逆H&S/BUY SL={sl_pips:.1f}pips > 上限{MAX_SL_PIPS}pipsのためスキップ")
             return None
-        tp        = round(close + risk * HS_RR, 3)
-        neck_proj = round(neckline + (neckline - head_val), 3)
+        # TP: ネックライン倍返し（backtest.pyと統一）
+        depth     = neckline - head_val
+        tp        = round(neckline + depth, 3)
+        if tp <= close:
+            tp = round(close + sl_pips / 100 * 2, 3)   # フォールバック: RR 1:2
         sl_basis  = f"右肩安値({rs_low:.3f})-5pips"
-        tp_basis  = f"RR 1:{HS_RR:.0f} / ネックライン倍返し目安 {neck_proj:.3f}"
+        tp_basis  = f"ネックライン倍返し({neckline:.3f} + {depth:.3f} = {tp:.3f})"
         return {
             "action":      "BUY",
             "strategy":    "逆H&S 4h",
@@ -778,8 +806,9 @@ def manage_position(pos: dict, current_price: float, now_jst: datetime) -> dict 
     """
     ポジション管理:
       - SL / TP 到達チェック
-      - 建値移動（含み益 BREAKEVEN_PIPS 超）→ OANDA API で SL 更新
       - 週末強制クローズ（金曜 23:00 JST）
+    ※ 建値移動（ブレークイーブン）は廃止
+       → バックテストで「含み益トレードを0pipsで強制終了→負け計上」の悪影響が判明
     """
     direction   = pos["direction"]
     entry_price = pos["entry_price"]
@@ -807,30 +836,6 @@ def manage_position(pos: dict, current_price: float, now_jst: datetime) -> dict 
     if sl_hit:
         _close_position(pos, current_price, pnl_pips, "SL到達 (損切り)", now_jst)
         return None
-
-    # ── 建値移動（ブレークイーブン） ─────────────────────────
-    if not pos.get("breakeven_done") and pnl_pips >= BREAKEVEN_PIPS:
-        new_sl = round(entry_price + 0.0001 if direction == "BUY"
-                       else entry_price - 0.0001, 3)
-        pos["stop_loss"]      = new_sl
-        pos["breakeven_done"] = True
-        save_position(pos)
-        logger.info(f"[建値移動] SL を {new_sl:.3f} に移動 (含み益 {pnl_pips:.1f} pips)")
-
-        # OANDA API で SL を更新
-        if not DRY_RUN and oanda and pos.get("trade_id"):
-            instrument = pos.get("pair", "USD/JPY").replace("/", "_")
-            try:
-                _with_retry(
-                    oanda.replace_stop_loss,
-                    trade_id=pos["trade_id"],
-                    new_price=new_sl,
-                    instrument=instrument,
-                    label="replace_stop_loss",
-                )
-                logger.info(f"[OANDA] 建値移動SL更新成功: tradeID={pos['trade_id']} 新SL={new_sl:.3f}")
-            except Exception as e:
-                logger.error(f"[OANDA] 建値移動SL更新失敗: {e}")
 
     return pos
 
@@ -879,15 +884,16 @@ def _close_position(pos: dict, close_price: float,
 # ─────────────────────────────────────────────────────────────
 def run():
     mode_label = "🔵 DRY RUN" if DRY_RUN else "🔴 本番"
-    logger.info("=" * 55)
+    logger.info("=" * 60)
     logger.info(f"  FX Trade Luce 起動  [{mode_label}]")
+    logger.info(f"  戦略: H&S 4時間足 × {len(PAIRS)}ペア")
     logger.info(f"  監視ペア: {', '.join(PAIRS.values())}")
     logger.info(f"  チェック間隔: {LOOP_SEC}秒  ロット: {LOT:,}通貨")
-    logger.info(f"  EMAクロス: EMA{EMA_FAST}/EMA{EMA_SLOW}  SL:ATR×{SL_MULT}  TP:ATR×{TP_MULT}")
-    logger.info(f"  H&S: buffer={HS_BUFFER_PIPS}pips  RR={HS_RR}")
+    logger.info(f"  H&S: distance={HS_DISTANCE}  tol={HS_TOL}  buffer={HS_BUFFER_PIPS}pips")
+    logger.info(f"  TP: ネックライン倍返し  SL上限: {MAX_SL_PIPS}pips")
     logger.info(f"  200SMA期間: {SMA_PERIOD}  リトライ: {MAX_RETRY}回")
-    logger.info(f"  建値移動: {BREAKEVEN_PIPS}pips超でSLを建値に移動")
-    logger.info("=" * 55)
+    logger.info(f"  ※ ブレイクイーブン廃止（バックテストで悪影響確認済み）")
+    logger.info("=" * 60)
 
     sync_position()
 
@@ -957,19 +963,11 @@ def run():
                     logger.error(f"{pair_name} データ取得失敗（{MAX_RETRY}回リトライ済み）: {e}")
                     continue
 
-                # USD/JPY: H&Sのみ（EMAクロスは廃止 — レンジ相場が多くダマシが多いため）
-                # GBP/JPY・EUR/JPY・AUD/JPY: EMAクロス+ADXのみ
-                HS_PAIRS  = {"USD/JPY"}
-                EMA_PAIRS = {"GBP/JPY", "EUR/JPY", "AUD/JPY"}
-                signal = None
-                if pair_name in HS_PAIRS:
-                    signal = check_hs_signal(df_4h)
-                    if signal:
-                        logger.info(f"[H&S/{pair_name}] {signal['action']}  {signal['reason']}")
-                elif pair_name in EMA_PAIRS:
-                    signal = check_ema_signal(df_1h)
-                    if signal:
-                        logger.info(f"[EMA/{pair_name}] {signal['action']}  {signal['reason']}")
+                # 全ペア H&S 戦略のみ（EMAクロスは廃止）
+                # バックテスト結果: USD/JPY +1333p, EUR/JPY +1023p, AUD/JPY +2895p
+                signal = check_hs_signal(df_4h)
+                if signal:
+                    logger.info(f"[H&S/{pair_name}] {signal['action']}  {signal['reason']}")
 
                 if signal:
                     active_positions = load_positions()
