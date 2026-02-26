@@ -1,8 +1,11 @@
 oandapyV20==0.7.2
 pandas>=2.0.0
 numpy>=1.26.0
+pandas_ta>=0.3.14b
+scipy>=1.11.0
 python-dotenv>=1.0.0
 yfinance>=0.2.40
+line-bot-sdk>=3.0.0
 matplotlib>=3.8.0
-backtesting>=0.3.3
+streamlit>=1.30.0
 seaborn>=0.13.0

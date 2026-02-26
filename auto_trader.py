@@ -1,15 +1,25 @@
 """
-auto_trader.py — CatHack AI Trader 司令塔
+auto_trader.py — FX Trade Luce 司令塔
 ==========================================
-H&S（4時間足）+ BB逆張り（1時間足）を監視し、
+H&S（4時間足）+ EMAクロス（1時間足）を監視し、
 シグナルが出たら LINE 通知 → OANDA 発注（または DRY RUN ログ）。
 
+戦略:
+  USD/JPY: H&S（4時間足）のみ
+           ※ USD/JPYはレンジ相場が多くEMAクロスが機能しにくいため廃止
+  GBP/JPY: EMAクロス（1時間足）+ ADXフィルター（ADX≥20）のみ
+           EMA12がEMA21を上抜け → BUY（SMA200より上のみ）
+           EMA12がEMA21を下抜け → SELL（SMA200より下のみ）
+
+テクニカル計算: pandas_ta
+H&S検知      : scipy.signal.find_peaks
+
 起動方法:
-    # ドライランモード（OANDAキーなしで動作確認）
+    # ドライランモード（デフォルト）
     python3 auto_trader.py
 
-    # 本番モード（.env に OANDA_API_KEY を設定後）
-    DRY_RUN=false python3 auto_trader.py
+    # 本番モード（.env に DRY_RUN=false 設定済みの場合）
+    python3 auto_trader.py
 
 停止: Ctrl+C
 """
@@ -21,12 +31,24 @@ import sys
 import json
 import time
 import logging
+import logging.handlers
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import contextlib
+import io
+
 import pandas as pd
 import numpy as np
+import pandas_ta as ta
+from scipy.signal import find_peaks
+
+
+def _quiet(func, *args, **kwargs):
+    """pandas_ta の verbose 出力を抑制して関数を実行する"""
+    with contextlib.redirect_stdout(io.StringIO()):
+        return func(*args, **kwargs)
 
 # ─────────────────────────────────────────────────────────────
 # ▌ .env 読み込み
@@ -44,48 +66,47 @@ def _load_env():
 
 _load_env()
 
-ROOT    = Path(__file__).parent
-JST     = ZoneInfo("Asia/Tokyo")
+ROOT = Path(__file__).parent
+JST  = ZoneInfo("Asia/Tokyo")
 
 # ─────────────────────────────────────────────────────────────
 # ▌ 設定
 # ─────────────────────────────────────────────────────────────
 DRY_RUN       = os.environ.get("DRY_RUN", "true").lower() != "false"
-LOOP_SEC      = int(os.environ.get("LOOP_SEC", "300"))    # 5分ごとにチェック
-LOT           = int(os.environ.get("LOT", "1000"))         # 通貨単位
+LOOP_SEC      = int(os.environ.get("LOOP_SEC", "300"))
+LOT           = int(os.environ.get("LOT", "20000"))
 SPREAD_PIPS   = float(os.environ.get("SPREAD_PIPS", "0.4"))
-MAX_RETRY     = int(os.environ.get("MAX_RETRY", "3"))      # APIリトライ回数
-SMA_PERIOD    = int(os.environ.get("SMA_PERIOD", "200"))   # トレンドフィルター用SMA期間
+MAX_RETRY     = int(os.environ.get("MAX_RETRY", "3"))
+SMA_PERIOD    = int(os.environ.get("SMA_PERIOD", "200"))
 
-# 監視ペア設定
-# yfinance ticker → 表示名 の辞書
+# 監視ペア: yfinance ticker → 表示名
 PAIRS = {
-    "USDJPY=X": "USD/JPY",   # BB逆張り(1h) + H&S(4h)
-    "GBPJPY=X": "GBP/JPY",   # H&S(4h) バックテスト成績◎
+    "USDJPY=X": "USD/JPY",
+    "GBPJPY=X": "GBP/JPY",
+    "EURJPY=X": "EUR/JPY",
+    "AUDJPY=X": "AUD/JPY",
 }
 
-# BB 設定
-BB_PERIOD     = 14
-BB_SIGMA      = 2.5
-RSI_PERIOD    = 14
-RSI_OS        = 30    # RSI 売られ過ぎ閾値
-RSI_OB        = 70    # RSI 買われ過ぎ閾値
+# EMAクロス 設定
+EMA_FAST   = 12    # 短期EMA
+EMA_SLOW   = 21    # 中期EMA
+ADX_PERIOD = 14    # ADX 計算期間
+ADX_MIN    = 15    # これ以上のADX値（トレンド相場）のみエントリー
+MAX_POSITIONS = 2  # 最大同時保有ポジション数
 
-# ── 変動型 SL / TP（固定pips廃止） ────────────────────────────
-# BB逆張り: ATRベース
-BB_SL_MULT     = 3.0   # SL = エントリー ± ATR × BB_SL_MULT
-BB_TP_MULT     = 6.0   # TP = エントリー ∓ ATR × BB_TP_MULT  (RR 1:2)
-# H&S: テクニカル形状ベース
-HS_BUFFER_PIPS = 0.05  # 右肩からのバッファ距離（5pips）
-HS_RR          = 2.0   # H&S戦略のリスクリワード比
-# ブレークイーブン（含み益がこの pips を超えたら建値にSL移動）
-BREAKEVEN_PIPS = 20
+# ── SL / TP ──────────────────────────────────────────────────
+SL_MULT        = 2.0   # SL = エントリー ± ATR × SL_MULT
+TP_MULT        = 4.0   # TP = エントリー ∓ ATR × TP_MULT (RR 1:2)
+HS_BUFFER_PIPS = 0.05  # H&S 右肩からのバッファ距離（5pips）
+HS_RR          = 2.0   # H&S リスクリワード比
+BREAKEVEN_PIPS = 20    # 建値移動トリガー
+MAX_SL_PIPS    = 50    # SL上限（pips）。これを超えるシグナルはスキップ
 
 # ─────────────────────────────────────────────────────────────
 # ▌ ロガー
 # ─────────────────────────────────────────────────────────────
 def _setup_logger() -> logging.Logger:
-    log = logging.getLogger("AutoTrader")
+    log = logging.getLogger("FXTradeLuce")
     if log.handlers:
         return log
     log.setLevel(logging.INFO)
@@ -94,7 +115,13 @@ def _setup_logger() -> logging.Logger:
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     log.addHandler(sh)
-    fh = logging.FileHandler(ROOT / "auto_trader.log", encoding="utf-8")
+    # ローテーション: 1MB で切り替え、最大5世代保持（合計 ~6MB）
+    fh = logging.handlers.RotatingFileHandler(
+        ROOT / "auto_trader.log",
+        maxBytes=1 * 1024 * 1024,   # 1MB
+        backupCount=5,
+        encoding="utf-8",
+    )
     fh.setFormatter(fmt)
     log.addHandler(fh)
     return log
@@ -125,7 +152,6 @@ except ImportError:
     FILTER_OK = False
     logger.warning("trade_filter.py が見つかりません。フィルターは無効です。")
 
-# OANDA executor（キーが来たら有効化）
 try:
     from oanda_executor import OandaExecutor
     oanda = OandaExecutor()
@@ -141,19 +167,17 @@ except ImportError:
 # ▌ 戦績トラッカー（trade_stats.json に永続化）
 # ─────────────────────────────────────────────────────────────
 STATS_FILE      = ROOT / "trade_stats.json"
-INITIAL_BALANCE = int(os.environ.get("INITIAL_BALANCE", "1000000"))  # 初期資金（円）
+INITIAL_BALANCE = int(os.environ.get("INITIAL_BALANCE", "1000000"))
 
 
 def _current_week() -> str:
-    """ISO週番号文字列（例: "2026-W08"）"""
     d = datetime.now(JST)
     return f"{d.isocalendar().year}-W{d.isocalendar().week:02d}"
 
 
 def load_stats() -> dict:
-    """戦績を読み込む。なければ初期値を返す"""
-    today = datetime.now(JST).strftime("%Y-%m-%d")
-    week  = _current_week()
+    today   = datetime.now(JST).strftime("%Y-%m-%d")
+    week    = _current_week()
     default = {
         "daily_pips":    0.0,
         "daily_jpy":     0,
@@ -170,19 +194,16 @@ def load_stats() -> dict:
         return default
     try:
         data = json.loads(STATS_FILE.read_text(encoding="utf-8"))
-        # 日付が変わっていたら日次リセット
         if data.get("last_date") != today:
             data["daily_pips"] = 0.0
             data["daily_jpy"]  = 0
             data["last_date"]  = today
-        # 週が変わっていたら週次リセット
         if data.get("last_week") != week:
             data["weekly_pips"]   = 0.0
             data["weekly_jpy"]    = 0
             data["weekly_trades"] = 0
             data["weekly_wins"]   = 0
             data["last_week"]     = week
-        # 旧フォーマット互換（キーがなければデフォルト値で補完）
         for k, v in default.items():
             data.setdefault(k, v)
         return data
@@ -196,7 +217,6 @@ def save_stats(stats: dict):
 
 
 def update_stats(pnl_pips: float, lot: int = LOT) -> dict:
-    """決済後に戦績を更新して返す"""
     pnl_jpy = int(pnl_pips * lot / 100)
     stats = load_stats()
     stats["daily_pips"]    = round(stats["daily_pips"]  + pnl_pips, 1)
@@ -211,38 +231,67 @@ def update_stats(pnl_pips: float, lot: int = LOT) -> dict:
     save_stats(stats)
     return stats
 
+
 # ─────────────────────────────────────────────────────────────
 # ▌ ポジション管理（position.json に永続化）
 # ─────────────────────────────────────────────────────────────
-POSITION_FILE = ROOT / "position.json"
+POSITION_FILE  = ROOT / "position.json"
+POSITIONS_FILE = ROOT / "positions.json"   # 複数ポジション用
 
-def load_position() -> dict | None:
-    """保存済みポジションを読み込む。なければ None"""
-    if not POSITION_FILE.exists():
-        return None
+
+def load_positions() -> list[dict]:
+    """全アクティブポジションをリストで返す"""
+    if not POSITIONS_FILE.exists():
+        return []
     try:
-        data = json.loads(POSITION_FILE.read_text(encoding="utf-8"))
-        return data if data.get("active") else None
+        data = json.loads(POSITIONS_FILE.read_text(encoding="utf-8"))
+        return [p for p in data if p.get("active")]
     except Exception:
-        return None
+        return []
+
+
+def save_positions(positions: list[dict]):
+    POSITIONS_FILE.write_text(
+        json.dumps(positions, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def add_position(pos: dict):
+    positions = load_positions()
+    pos["active"] = True
+    positions.append(pos)
+    save_positions(positions)
+
+
+def remove_position(pos: dict):
+    positions = load_positions()
+    positions = [p for p in positions
+                 if not (p.get("pair") == pos.get("pair") and
+                         p.get("entry_time") == pos.get("entry_time"))]
+    save_positions(positions)
+
+
+# 後方互換（旧コードとの互換性維持）
+def load_position() -> dict | None:
+    positions = load_positions()
+    return positions[0] if positions else None
+
 
 def save_position(pos: dict | None):
-    """ポジションを保存（None で削除）"""
     if pos is None:
-        POSITION_FILE.write_text(json.dumps({"active": False}), encoding="utf-8")
-    else:
-        pos["active"] = True
-        POSITION_FILE.write_text(json.dumps(pos, ensure_ascii=False, indent=2),
-                                 encoding="utf-8")
+        return
+    add_position(pos)
+
 
 def clear_position():
-    save_position(None)
+    pass   # remove_position で個別削除するため不要
+
 
 # ─────────────────────────────────────────────────────────────
 # ▌ データ取得
 # ─────────────────────────────────────────────────────────────
 def fetch_data(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """yfinance から指定ペアの 1h / 4h 足を取得"""
+    """yfinance から 1h / 4h 足を取得"""
     import yfinance as yf
     end   = datetime.now(tz=timezone.utc)
     start = end - timedelta(days=90)
@@ -256,220 +305,232 @@ def fetch_data(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     ).dropna()
     return df_1h, df_4h
 
-# ─────────────────────────────────────────────────────────────
-# ▌ テクニカル計算
-# ─────────────────────────────────────────────────────────────
-def calc_bb(df: pd.DataFrame, period: int = BB_PERIOD, sigma: float = BB_SIGMA):
-    """ボリンジャーバンド計算。(upper, mid, lower) を返す"""
-    mid   = df["Close"].rolling(period).mean()
-    std   = df["Close"].rolling(period).std()
-    return mid + sigma * std, mid, mid - sigma * std
 
-def calc_rsi(df: pd.DataFrame, period: int = RSI_PERIOD) -> pd.Series:
-    """RSI 計算"""
-    delta = df["Close"].diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+# ─────────────────────────────────────────────────────────────
+# ▌ テクニカル計算（pandas_ta 使用）
+# ─────────────────────────────────────────────────────────────
+def calc_ema(df: pd.DataFrame, period: int) -> pd.Series:
+    """EMA（pandas_ta）"""
+    return _quiet(df.ta.ema, length=period, append=False)
 
-def calc_adx(df: pd.DataFrame, period: int = 14) -> float:
-    """ADX 計算（最終値のみ）"""
-    high  = df["High"]
-    low   = df["Low"]
-    close = df["Close"]
-    tr    = pd.concat([high - low,
-                       (high - close.shift()).abs(),
-                       (low  - close.shift()).abs()], axis=1).max(axis=1)
-    dm_p  = (high.diff()).clip(lower=0)
-    dm_m  = (-low.diff()).clip(lower=0)
-    atr_  = tr.ewm(alpha=1/period, adjust=False).mean()
-    di_p  = 100 * dm_p.ewm(alpha=1/period, adjust=False).mean() / atr_.replace(0, np.nan)
-    di_m  = 100 * dm_m.ewm(alpha=1/period, adjust=False).mean() / atr_.replace(0, np.nan)
-    dx    = (100 * (di_p - di_m).abs() / (di_p + di_m).replace(0, np.nan))
-    adx   = dx.ewm(alpha=1/period, adjust=False).mean()
-    return float(adx.iloc[-1]) if not adx.empty else 0.0
 
 def calc_atr(df: pd.DataFrame, period: int = 14) -> float:
-    """ATR（Average True Range）の最新値を返す"""
-    high  = df["High"]
-    low   = df["Low"]
-    close = df["Close"]
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low  - close.shift()).abs(),
-    ], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
-    return float(atr.iloc[-1]) if not atr.empty else 0.001
+    """ATR の最新値（pandas_ta）"""
+    atr_s = _quiet(df.ta.atr, length=period, append=False)
+    val   = atr_s.iloc[-1] if atr_s is not None and not atr_s.empty else np.nan
+    return float(val) if not np.isnan(val) else 0.001
+
+
+def calc_adx(df: pd.DataFrame, period: int = 14) -> float:
+    """ADX の最新値（pandas_ta）"""
+    adx_df = _quiet(df.ta.adx, length=period, append=False)
+    col    = f"ADX_{period}"
+    if adx_df is None or col not in adx_df.columns:
+        return 0.0
+    val = adx_df[col].iloc[-1]
+    return float(val) if not np.isnan(val) else 0.0
 
 
 def calc_sma200(df: pd.DataFrame, period: int = SMA_PERIOD) -> float:
-    """SMA計算（最終値のみ）。データ不足時は全期間平均で補完"""
+    """SMA の最新値。データ不足時は全期間平均で補完"""
     if len(df) < period:
         return float(df["Close"].mean())
     val = df["Close"].rolling(period).mean().iloc[-1]
     return float(val) if not np.isnan(val) else float(df["Close"].mean())
 
 
-def detect_hs(df: pd.DataFrame, window: int = 5, tol: float = 0.015) -> dict | None:
+# ─────────────────────────────────────────────────────────────
+# ▌ H&S パターン検知（scipy.signal.find_peaks 使用）
+# ─────────────────────────────────────────────────────────────
+def detect_hs(df: pd.DataFrame, distance: int = 5, tol: float = 0.015) -> dict | None:
     """
-    H&S パターン検知。右肩・頭・ネックライン情報を含む辞書を返す。
+    scipy.signal.find_peaks でH&Sパターンを検知する。
 
     戻り値:
         {
           "pattern":             "HEAD_AND_SHOULDERS" | "INV_HEAD_AND_SHOULDERS",
-          "right_shoulder_high": float,   # 右肩高値（天井H&S の SL 基準）
-          "right_shoulder_low":  float,   # 右肩安値（逆H&S の SL 基準）
-          "head":                float,   # 頭の極値
-          "neckline":            float,   # ネックライン（簡易）
+          "right_shoulder_high": float,
+          "right_shoulder_low":  float,
+          "head":                float,
+          "neckline":            float,
         }
         or None
     """
-    if len(df) < window * 5:
+    if len(df) < distance * 6:
         return None
 
-    roll_highs = df["High"].rolling(window).max()
-    roll_lows  = df["Low"].rolling(window).min()
+    highs = df["High"].values
+    lows  = df["Low"].values
 
-    head_h = roll_highs.iloc[-1]
-    head_l = roll_lows.iloc[-1]
+    # ── 天井 H&S（3つのピーク：左肩 < 頭 > 右肩、左肩 ≈ 右肩） ─────
+    peak_idx, _ = find_peaks(highs, distance=distance)
+    if len(peak_idx) >= 3:
+        ls_i, hd_i, rs_i = int(peak_idx[-3]), int(peak_idx[-2]), int(peak_idx[-1])
+        ls   = highs[ls_i]
+        head = highs[hd_i]
+        rs   = highs[rs_i]
 
-    prev3_h = roll_highs.iloc[-window * 3: -window * 2]
-    prev1_h = roll_highs.iloc[-window * 2: -window]
-    if prev3_h.empty or prev1_h.empty:
-        return None
+        # 右肩が直近 distance*3 本以内にあるか確認（古いパターンを除外）
+        min_rs_idx = len(highs) - distance * 3
+        if rs_i < min_rs_idx:
+            return None
 
-    left_h  = float(prev3_h.max())
-    right_h = float(prev1_h.max())   # 右肩高値
+        shoulders_similar = abs(ls - rs) / (head + 1e-9) < tol
+        head_dominant     = head > max(ls, rs) * (1 + tol * 0.5)
 
-    # ── 天井 H&S ─────────────────────────────────────────────
-    if abs(left_h - right_h) / (head_h + 1e-9) < tol and \
-            head_h > max(left_h, right_h) * 1.005:
-        # ネックライン: 右肩〜頭のゾーンの最安値（簡易近似）
-        neck_zone  = df["Low"].iloc[-window * 2:]
-        neckline   = float(neck_zone.min())
-        rs_lows    = df["Low"].iloc[-window * 2: -window]
-        right_low  = float(rs_lows.min()) if not rs_lows.empty \
-                     else float(df["Low"].iloc[-1])
-        return {
-            "pattern":             "HEAD_AND_SHOULDERS",
-            "right_shoulder_high": right_h,
-            "right_shoulder_low":  right_low,
-            "head":                float(head_h),
-            "neckline":            neckline,
-        }
+        if shoulders_similar and head_dominant:
+            # ネックライン: 左肩〜頭、頭〜右肩 間の最安値の平均
+            neck1    = float(lows[ls_i:hd_i].min()) if hd_i > ls_i else float(lows[ls_i])
+            neck2    = float(lows[hd_i:rs_i].min()) if rs_i > hd_i else float(lows[hd_i])
+            neckline = round((neck1 + neck2) / 2, 3)
 
-    # ── 逆 H&S ──────────────────────────────────────────────
-    prev3_l = roll_lows.iloc[-window * 3: -window * 2]
-    prev1_l = roll_lows.iloc[-window * 2: -window]
-    if prev3_l.empty or prev1_l.empty:
-        return None
+            # 右肩の安値（右肩ピーク周辺の最安値）
+            buf      = max(1, distance // 2)
+            rs_low   = float(lows[max(0, rs_i - buf): rs_i + buf + 1].min())
 
-    left_l  = float(prev3_l.min())
-    right_l = float(prev1_l.min())   # 右肩安値
+            return {
+                "pattern":             "HEAD_AND_SHOULDERS",
+                "right_shoulder_high": float(rs),
+                "right_shoulder_low":  rs_low,
+                "head":                float(head),
+                "neckline":            neckline,
+            }
 
-    if abs(left_l - right_l) / (head_l + 1e-9) < tol and \
-            head_l < min(left_l, right_l) * 0.995:
-        neck_zone   = df["High"].iloc[-window * 2:]
-        neckline    = float(neck_zone.max())
-        rs_highs    = df["High"].iloc[-window * 2: -window]
-        right_high  = float(rs_highs.max()) if not rs_highs.empty \
-                      else float(df["High"].iloc[-1])
-        return {
-            "pattern":             "INV_HEAD_AND_SHOULDERS",
-            "right_shoulder_high": right_high,
-            "right_shoulder_low":  right_l,
-            "head":                float(head_l),
-            "neckline":            neckline,
-        }
+    # ── 逆 H&S（3つのトラフ：左肩 > 頭 < 右肩、左肩 ≈ 右肩） ──────
+    trough_idx, _ = find_peaks(-lows, distance=distance)
+    if len(trough_idx) >= 3:
+        ls_i, hd_i, rs_i = int(trough_idx[-3]), int(trough_idx[-2]), int(trough_idx[-1])
+        ls   = lows[ls_i]
+        head = lows[hd_i]
+        rs   = lows[rs_i]
+
+        # 右肩が直近 distance*3 本以内にあるか確認（古いパターンを除外）
+        min_rs_idx = len(lows) - distance * 3
+        if rs_i < min_rs_idx:
+            return None
+
+        shoulders_similar = abs(ls - rs) / (abs(head) + 1e-9) < tol
+        head_dominant     = head < min(ls, rs) * (1 - tol * 0.5)
+
+        if shoulders_similar and head_dominant:
+            neck1    = float(highs[ls_i:hd_i].max()) if hd_i > ls_i else float(highs[ls_i])
+            neck2    = float(highs[hd_i:rs_i].max()) if rs_i > hd_i else float(highs[hd_i])
+            neckline = round((neck1 + neck2) / 2, 3)
+
+            buf      = max(1, distance // 2)
+            rs_high  = float(highs[max(0, rs_i - buf): rs_i + buf + 1].max())
+
+            return {
+                "pattern":             "INV_HEAD_AND_SHOULDERS",
+                "right_shoulder_high": rs_high,
+                "right_shoulder_low":  float(rs),
+                "head":                float(head),
+                "neckline":            neckline,
+            }
 
     return None
+
 
 # ─────────────────────────────────────────────────────────────
 # ▌ シグナル判定
 # ─────────────────────────────────────────────────────────────
-def check_bb_signal(df_1h: pd.DataFrame) -> dict | None:
+def check_ema_signal(df_1h: pd.DataFrame) -> dict | None:
     """
-    BB逆張り（1h）シグナルチェック。
-    SL/TP は ATR ベースの変動値:
-      SL = エントリー ± ATR × BB_SL_MULT (×3.0)
-      TP = エントリー ∓ ATR × BB_TP_MULT (×6.0 / RR 1:2)
-    200SMAトレンドフィルター付き。
+    EMAクロス（1h）シグナルチェック。
+    EMA9 が EMA21 を上抜け → BUY（SMA200より上）
+    EMA9 が EMA21 を下抜け → SELL（SMA200より下）
+    SL = ATR × SL_MULT、TP = ATR × TP_MULT（RR 1:2）
     """
-    if len(df_1h) < BB_PERIOD + 5:
+    if len(df_1h) < max(EMA_SLOW, SMA_PERIOD) + 5:
         return None
 
-    upper, mid, lower = calc_bb(df_1h)
-    rsi               = calc_rsi(df_1h)
-    close             = float(df_1h["Close"].iloc[-1])
-    rsi_val           = float(rsi.iloc[-1])
-    upper_val         = float(upper.iloc[-1])
-    lower_val         = float(lower.iloc[-1])
+    ema_fast  = calc_ema(df_1h, EMA_FAST)
+    ema_slow  = calc_ema(df_1h, EMA_SLOW)
+    if ema_fast is None or ema_slow is None:
+        return None
 
-    # ATR / SMA200
+    close        = float(df_1h["Close"].iloc[-1])
     atr          = calc_atr(df_1h)
     atr_pips     = round(atr * 100, 1)
     sma200       = calc_sma200(df_1h)
     above_sma200 = close > sma200
+    adx          = calc_adx(df_1h, ADX_PERIOD)
 
-    if close <= lower_val and rsi_val < RSI_OS:
+    # ADXフィルター：トレンドが弱い横ばい相場はスキップ
+    if adx < ADX_MIN:
+        logger.info(f"[ADXフィルター] ADX={adx:.1f} < {ADX_MIN} — 横ばい相場のためスキップ")
+        return None
+
+    # 現在足と1本前でクロス判定
+    ef_now  = float(ema_fast.iloc[-1])
+    es_now  = float(ema_slow.iloc[-1])
+    ef_prev = float(ema_fast.iloc[-2])
+    es_prev = float(ema_slow.iloc[-2])
+
+    sl_basis = f"ATR×{SL_MULT} (ATR={atr_pips:.1f}pips)"
+    tp_basis = f"ATR×{TP_MULT} (RR 1:{int(TP_MULT / SL_MULT)})"
+
+    # ── ゴールデンクロス → BUY ───────────────────────────────
+    golden_cross = (ef_prev <= es_prev) and (ef_now > es_now)
+    if golden_cross:
         if not above_sma200:
-            logger.info(f"[SMAフィルター] BB/BUYシグナル → SMA200({sma200:.3f})より下のためスキップ")
+            logger.info(f"[SMAフィルター] EMA/BUYシグナル → SMA200({sma200:.3f})より下のためスキップ")
             return None
-        sl       = round(close - atr * BB_SL_MULT, 3)
-        tp       = round(close + atr * BB_TP_MULT, 3)
-        sl_basis = f"ATR×{BB_SL_MULT} (ATR={atr_pips:.1f}pips)"
-        tp_basis = f"ATR×{BB_TP_MULT} (RR 1:{int(BB_TP_MULT / BB_SL_MULT)})"
+        sl      = round(close - atr * SL_MULT, 3)
+        tp      = round(close + atr * TP_MULT, 3)
+        sl_pips = abs(close - sl) * 100
+        if sl_pips > MAX_SL_PIPS:
+            logger.info(f"[SLキャップ] EMA/BUY SL={sl_pips:.1f}pips > 上限{MAX_SL_PIPS}pipsのためスキップ")
+            return None
         return {
             "action":      "BUY",
-            "strategy":    f"BB逆張り 1h (σ={BB_SIGMA})",
+            "strategy":    f"EMAクロス 1h (EMA{EMA_FAST}/EMA{EMA_SLOW})",
             "reason":      (
-                f"RSI={rsi_val:.1f}（売られ過ぎ）, BB下限={lower_val:.3f}タッチ, "
+                f"ゴールデンクロス EMA{EMA_FAST}({ef_now:.3f})>EMA{EMA_SLOW}({es_now:.3f}), "
                 f"SMA200={sma200:.3f}より上 | "
                 f"🛑 SL根拠: {sl_basis} | 🎯 TP根拠: {tp_basis}"
             ),
             "price":       close,
-            "rsi":         rsi_val,
             "stop_loss":   sl,
             "take_profit": tp,
             "sl_basis":    sl_basis,
             "tp_basis":    tp_basis,
         }
 
-    if close >= upper_val and rsi_val > RSI_OB:
+    # ── デッドクロス → SELL ──────────────────────────────────
+    dead_cross = (ef_prev >= es_prev) and (ef_now < es_now)
+    if dead_cross:
         if above_sma200:
-            logger.info(f"[SMAフィルター] BB/SELLシグナル → SMA200({sma200:.3f})より上のためスキップ")
+            logger.info(f"[SMAフィルター] EMA/SELLシグナル → SMA200({sma200:.3f})より上のためスキップ")
             return None
-        sl       = round(close + atr * BB_SL_MULT, 3)
-        tp       = round(close - atr * BB_TP_MULT, 3)
-        sl_basis = f"ATR×{BB_SL_MULT} (ATR={atr_pips:.1f}pips)"
-        tp_basis = f"ATR×{BB_TP_MULT} (RR 1:{int(BB_TP_MULT / BB_SL_MULT)})"
+        sl      = round(close + atr * SL_MULT, 3)
+        tp      = round(close - atr * TP_MULT, 3)
+        sl_pips = abs(close - sl) * 100
+        if sl_pips > MAX_SL_PIPS:
+            logger.info(f"[SLキャップ] EMA/SELL SL={sl_pips:.1f}pips > 上限{MAX_SL_PIPS}pipsのためスキップ")
+            return None
         return {
             "action":      "SELL",
-            "strategy":    f"BB逆張り 1h (σ={BB_SIGMA})",
+            "strategy":    f"EMAクロス 1h (EMA{EMA_FAST}/EMA{EMA_SLOW})",
             "reason":      (
-                f"RSI={rsi_val:.1f}（買われ過ぎ）, BB上限={upper_val:.3f}タッチ, "
+                f"デッドクロス EMA{EMA_FAST}({ef_now:.3f})<EMA{EMA_SLOW}({es_now:.3f}), "
                 f"SMA200={sma200:.3f}より下 | "
                 f"🛑 SL根拠: {sl_basis} | 🎯 TP根拠: {tp_basis}"
             ),
             "price":       close,
-            "rsi":         rsi_val,
             "stop_loss":   sl,
             "take_profit": tp,
             "sl_basis":    sl_basis,
             "tp_basis":    tp_basis,
         }
+
     return None
 
 
 def check_hs_signal(df_4h: pd.DataFrame) -> dict | None:
     """
     H&S（4h）シグナルチェック。
-    SL/TP はテクニカル形状ベースの変動値:
-      天井H&S SELL: SL = 右肩高値 + HS_BUFFER_PIPS, TP = RR 1:HS_RR
-      逆H&S  BUY : SL = 右肩安値 - HS_BUFFER_PIPS, TP = RR 1:HS_RR
-    200SMAトレンドフィルター付き。
+    SL/TP はテクニカル形状ベース、200SMAフィルター付き。
     """
     if len(df_4h) < 30:
         return None
@@ -478,33 +539,30 @@ def check_hs_signal(df_4h: pd.DataFrame) -> dict | None:
     if hs is None:
         return None
 
-    close   = float(df_4h["Close"].iloc[-1])
-    adx     = calc_adx(df_4h)
-    pattern = hs["pattern"]
-
+    close        = float(df_4h["Close"].iloc[-1])
+    adx          = calc_adx(df_4h)
+    pattern      = hs["pattern"]
     sma200       = calc_sma200(df_4h)
     above_sma200 = close > sma200
 
-    # ── 天井 H&S → SELL ───────────────────────────────────────
+    # ── 天井 H&S → SELL ──────────────────────────────────────
     if pattern == "HEAD_AND_SHOULDERS":
         if above_sma200:
             logger.info(f"[SMAフィルター] H&S/SELLシグナル → SMA200({sma200:.3f})より上のためスキップ")
             return None
-
-        rs_high  = hs["right_shoulder_high"]
-        neckline = hs["neckline"]
-        head_val = hs["head"]
-
-        sl   = round(rs_high + HS_BUFFER_PIPS, 3)  # 右肩高値 + 5pips
-        risk = sl - close
-        tp   = round(close - risk * HS_RR, 3)       # RR 1:HS_RR
-
-        # ネックライン倍返し目安（参考）
+        rs_high   = hs["right_shoulder_high"]
+        neckline  = hs["neckline"]
+        head_val  = hs["head"]
+        sl        = round(rs_high + HS_BUFFER_PIPS, 3)
+        risk      = sl - close
+        sl_pips   = abs(risk) * 100
+        if sl_pips > MAX_SL_PIPS:
+            logger.info(f"[SLキャップ] H&S/SELL SL={sl_pips:.1f}pips > 上限{MAX_SL_PIPS}pipsのためスキップ")
+            return None
+        tp        = round(close - risk * HS_RR, 3)
         neck_proj = round(neckline - (head_val - neckline), 3)
-
-        sl_basis = f"右肩高値({rs_high:.3f})+5pips"
-        tp_basis = f"RR 1:{HS_RR:.0f} / ネックライン倍返し目安 {neck_proj:.3f}"
-
+        sl_basis  = f"右肩高値({rs_high:.3f})+5pips"
+        tp_basis  = f"RR 1:{HS_RR:.0f} / ネックライン倍返し目安 {neck_proj:.3f}"
         return {
             "action":      "SELL",
             "strategy":    "H&S 4h",
@@ -520,26 +578,24 @@ def check_hs_signal(df_4h: pd.DataFrame) -> dict | None:
             "tp_basis":    tp_basis,
         }
 
-    # ── 逆 H&S → BUY ────────────────────────────────────────
+    # ── 逆 H&S → BUY ─────────────────────────────────────────
     if pattern == "INV_HEAD_AND_SHOULDERS":
         if not above_sma200:
             logger.info(f"[SMAフィルター] 逆H&S/BUYシグナル → SMA200({sma200:.3f})より下のためスキップ")
             return None
-
-        rs_low   = hs["right_shoulder_low"]
-        neckline = hs["neckline"]
-        head_val = hs["head"]
-
-        sl   = round(rs_low - HS_BUFFER_PIPS, 3)   # 右肩安値 - 5pips
-        risk = close - sl
-        tp   = round(close + risk * HS_RR, 3)       # RR 1:HS_RR
-
-        # ネックライン倍返し目安（参考）
+        rs_low    = hs["right_shoulder_low"]
+        neckline  = hs["neckline"]
+        head_val  = hs["head"]
+        sl        = round(rs_low - HS_BUFFER_PIPS, 3)
+        risk      = close - sl
+        sl_pips   = abs(risk) * 100
+        if sl_pips > MAX_SL_PIPS:
+            logger.info(f"[SLキャップ] 逆H&S/BUY SL={sl_pips:.1f}pips > 上限{MAX_SL_PIPS}pipsのためスキップ")
+            return None
+        tp        = round(close + risk * HS_RR, 3)
         neck_proj = round(neckline + (neckline - head_val), 3)
-
-        sl_basis = f"右肩安値({rs_low:.3f})-5pips"
-        tp_basis = f"RR 1:{HS_RR:.0f} / ネックライン倍返し目安 {neck_proj:.3f}"
-
+        sl_basis  = f"右肩安値({rs_low:.3f})-5pips"
+        tp_basis  = f"RR 1:{HS_RR:.0f} / ネックライン倍返し目安 {neck_proj:.3f}"
         return {
             "action":      "BUY",
             "strategy":    "逆H&S 4h",
@@ -557,15 +613,12 @@ def check_hs_signal(df_4h: pd.DataFrame) -> dict | None:
 
     return None
 
+
 # ─────────────────────────────────────────────────────────────
 # ▌ リトライヘルパー
 # ─────────────────────────────────────────────────────────────
 def _with_retry(func, *args, max_retry: int = MAX_RETRY,
                 wait_sec: int = 60, label: str = "", **kwargs):
-    """
-    func を最大 max_retry 回リトライする。
-    失敗のたびに wait_sec 秒待機し、最後も失敗したら例外を再送出する。
-    """
     for attempt in range(1, max_retry + 1):
         try:
             return func(*args, **kwargs)
@@ -585,38 +638,44 @@ def _with_retry(func, *args, max_retry: int = MAX_RETRY,
 def sync_position():
     """
     起動時に OANDA API と position.json を照合。
-    ズレがあれば API 側の情報を正として position.json を上書きする。
     DRY_RUN または OANDA未接続 の場合はスキップ。
     """
     if not OANDA_OK or DRY_RUN:
         logger.info("[sync] DRY_RUN または OANDA未接続のためスキップ")
         return
     try:
-        oanda_positions = oanda.get_open_positions()   # list of dicts
-        local_pos       = load_position()
+        oanda_positions = oanda.get_open_positions()
+        local_positions = load_positions()
 
-        if not oanda_positions and local_pos:
-            logger.warning("[sync] OANDA にポジションなし → position.json をクリア")
-            clear_position()
+        if not oanda_positions and local_positions:
+            logger.warning("[sync] OANDA にポジションなし → positions.json をクリア")
+            save_positions([])
 
-        elif oanda_positions and not local_pos:
-            logger.warning("[sync] OANDA にポジションあり → position.json を復元")
-            p     = oanda_positions[0]   # 1ポジションのみ管理
-            pair  = p.get("instrument", "USD_JPY").replace("_", "/")
-            units = float(p.get("units", 0))
-            save_position({
-                "active":         True,
-                "pair":           pair,
-                "direction":      "BUY" if units > 0 else "SELL",
-                "entry_price":    float(p.get("averagePrice", 0)),
-                "stop_loss":      0.0,
-                "take_profit":    0.0,
-                "strategy":       "restored_from_oanda",
-                "entry_time":     datetime.now(JST).isoformat(),
-                "breakeven_done": False,
-            })
-            logger.info(f"[sync] ポジション復元: {pair} {'BUY' if units > 0 else 'SELL'}")
-
+        elif oanda_positions and not local_positions:
+            logger.warning("[sync] OANDA にポジションあり → positions.json を復元")
+            for p in oanda_positions:
+                pair     = p.get("instrument", "USD_JPY").replace("_", "/")
+                units    = float(p.get("units", 0))
+                instrument = pair.replace("/", "_")
+                trade_id = ""
+                try:
+                    trade_id = oanda.get_open_trade_id(instrument) or ""
+                except Exception:
+                    pass
+                add_position({
+                    "active":         True,
+                    "pair":           pair,
+                    "direction":      "BUY" if units > 0 else "SELL",
+                    "entry_price":    float(p.get("entry_price", 0)),
+                    "stop_loss":      0.0,
+                    "take_profit":    0.0,
+                    "strategy":       "restored_from_oanda",
+                    "entry_time":     datetime.now(JST).isoformat(),
+                    "breakeven_done": False,
+                    "trade_id":       trade_id,
+                })
+                logger.info(f"[sync] ポジション復元: {pair} {'BUY' if units > 0 else 'SELL'}"
+                            f" tradeID={trade_id}")
         else:
             logger.info("[sync] ポジション照合OK（ズレなし）")
 
@@ -630,36 +689,31 @@ def sync_position():
 def place_order(signal: dict, now_jst: datetime, pair: str = "USD/JPY") -> dict | None:
     """
     エントリー発注。DRY_RUN の場合はログのみ。
-    成功したらポジション dict を返す。
+    成功したらポジション dict を返す（trade_id を含む）。
     """
-    action = signal["action"]
-    price  = signal["price"]
+    action     = signal["action"]
+    price      = signal["price"]
+    sl         = signal.get("stop_loss")
+    tp         = signal.get("take_profit")
+    instrument = pair.replace("/", "_")
+    trade_id   = ""
 
-    # ── 変動型 SL / TP（シグナルから取得） ──────────────────
-    sl = signal.get("stop_loss")
-    tp = signal.get("take_profit")
     if sl is None or tp is None:
-        # フォールバック: ATRベースで再計算
         logger.warning("[place_order] SL/TPがシグナルに含まれていません。ATRフォールバックを使用。")
         import yfinance as yf
-        ticker = pair.replace("/", "_").replace("_", "") + "=X"
+        ticker = pair.replace("/", "").replace("_", "") + "=X"
         try:
-            import pandas as _pd
-            from datetime import timedelta as _td
             _raw = yf.download(ticker, period="30d", interval="1h",
                                progress=False, auto_adjust=True)
-            if isinstance(_raw.columns, _pd.MultiIndex):
+            if isinstance(_raw.columns, pd.MultiIndex):
                 _raw.columns = _raw.columns.get_level_values(0)
             atr_fb = calc_atr(_raw)
         except Exception:
-            atr_fb = 0.5  # 最終フォールバック 50pips
+            atr_fb = 0.5
         sl = round(price - atr_fb * BB_SL_MULT if action == "BUY"
                    else price + atr_fb * BB_SL_MULT, 3)
         tp = round(price + atr_fb * BB_TP_MULT if action == "BUY"
                    else price - atr_fb * BB_TP_MULT, 3)
-
-    # OANDA instrument 形式に変換（例: "GBP/JPY" → "GBP_JPY"）
-    instrument = pair.replace("/", "_")
 
     if DRY_RUN:
         logger.info(f"[DRY RUN] {pair} {action} @ {price:.3f}  SL:{sl:.3f}  TP:{tp:.3f}  "
@@ -667,7 +721,7 @@ def place_order(signal: dict, now_jst: datetime, pair: str = "USD/JPY") -> dict 
     else:
         if oanda:
             try:
-                _with_retry(
+                resp = _with_retry(
                     oanda.place_order,
                     instrument=instrument,
                     units=LOT if action == "BUY" else -LOT,
@@ -675,14 +729,20 @@ def place_order(signal: dict, now_jst: datetime, pair: str = "USD/JPY") -> dict 
                     take_profit=tp,
                     label="place_order",
                 )
-                logger.info(f"[OANDA] 発注成功: {pair} {action} @ {price:.3f}")
+                # tradeID を取得（建値移動で使用）
+                trade_id = (
+                    str(resp.get("orderFillTransaction", {})
+                              .get("tradeOpened", {})
+                              .get("tradeID", ""))
+                    or str(resp.get("relatedTransactionIDs", [""])[0])
+                )
+                logger.info(f"[OANDA] 発注成功: {pair} {action} @ {price:.3f}  tradeID={trade_id}")
             except Exception as e:
                 logger.error(f"[OANDA] 発注失敗（{MAX_RETRY}回リトライ済み）: {e}")
                 if LINE_OK:
                     notify_error(f"{pair} 発注失敗: {e}")
                 return None
 
-    # LINE 通知
     if LINE_OK:
         notify_entry(
             direction=action,
@@ -705,20 +765,21 @@ def place_order(signal: dict, now_jst: datetime, pair: str = "USD/JPY") -> dict 
         "strategy":       signal["strategy"],
         "entry_time":     now_jst.isoformat(),
         "breakeven_done": False,
+        "trade_id":       trade_id,
     }
-    save_position(pos)
+    add_position(pos)   # 複数ポジションリストに追加
     return pos
+
 
 # ─────────────────────────────────────────────────────────────
 # ▌ ポジション管理
 # ─────────────────────────────────────────────────────────────
 def manage_position(pos: dict, current_price: float, now_jst: datetime) -> dict | None:
     """
-    ポジション管理。
-    - SL / TP 到達チェック
-    - 建値移動（含み益 BREAKEVEN_PIPS 超）
-    - 週末強制クローズ（金曜 23:00 JST）
-    戻り値: 更新後ポジション / None（決済済み）
+    ポジション管理:
+      - SL / TP 到達チェック
+      - 建値移動（含み益 BREAKEVEN_PIPS 超）→ OANDA API で SL 更新
+      - 週末強制クローズ（金曜 23:00 JST）
     """
     direction   = pos["direction"]
     entry_price = pos["entry_price"]
@@ -728,37 +789,51 @@ def manage_position(pos: dict, current_price: float, now_jst: datetime) -> dict 
     pnl_pips = (current_price - entry_price) * 100 if direction == "BUY" \
                else (entry_price - current_price) * 100
 
-    # ── 週末強制クローズ ────────────────────────────────────
-    is_friday_close = (now_jst.weekday() == 4 and now_jst.hour >= 23)
-    if is_friday_close:
-        reason = "週末強制クローズ（金曜 23:00 JST）"
-        _close_position(pos, current_price, pnl_pips, reason, now_jst)
+    # ── 週末強制クローズ ──────────────────────────────────────
+    if now_jst.weekday() == 4 and now_jst.hour >= 23:
+        _close_position(pos, current_price, pnl_pips, "週末強制クローズ（金曜 23:00 JST）", now_jst)
         return None
 
-    # ── TP 到達 ────────────────────────────────────────────
+    # ── TP 到達 ────────────────────────────────────────────────
     tp_hit = (direction == "BUY"  and current_price >= tp) or \
              (direction == "SELL" and current_price <= tp)
     if tp_hit:
         _close_position(pos, current_price, pnl_pips, "TP到達 (利確)", now_jst)
         return None
 
-    # ── SL 到達 ────────────────────────────────────────────
+    # ── SL 到達 ────────────────────────────────────────────────
     sl_hit = (direction == "BUY"  and current_price <= sl) or \
              (direction == "SELL" and current_price >= sl)
     if sl_hit:
         _close_position(pos, current_price, pnl_pips, "SL到達 (損切り)", now_jst)
         return None
 
-    # ── 建値移動（ブレークイーブン） ──────────────────────
+    # ── 建値移動（ブレークイーブン） ─────────────────────────
     if not pos.get("breakeven_done") and pnl_pips >= BREAKEVEN_PIPS:
-        new_sl = entry_price + 0.01 / 100 if direction == "BUY" \
-                 else entry_price - 0.01 / 100
-        pos["stop_loss"]     = new_sl
+        new_sl = round(entry_price + 0.0001 if direction == "BUY"
+                       else entry_price - 0.0001, 3)
+        pos["stop_loss"]      = new_sl
         pos["breakeven_done"] = True
         save_position(pos)
         logger.info(f"[建値移動] SL を {new_sl:.3f} に移動 (含み益 {pnl_pips:.1f} pips)")
 
+        # OANDA API で SL を更新
+        if not DRY_RUN and oanda and pos.get("trade_id"):
+            instrument = pos.get("pair", "USD/JPY").replace("/", "_")
+            try:
+                _with_retry(
+                    oanda.replace_stop_loss,
+                    trade_id=pos["trade_id"],
+                    new_price=new_sl,
+                    instrument=instrument,
+                    label="replace_stop_loss",
+                )
+                logger.info(f"[OANDA] 建値移動SL更新成功: tradeID={pos['trade_id']} 新SL={new_sl:.3f}")
+            except Exception as e:
+                logger.error(f"[OANDA] 建値移動SL更新失敗: {e}")
+
     return pos
+
 
 def _close_position(pos: dict, close_price: float,
                     pnl_pips: float, reason: str, now_jst: datetime):
@@ -780,7 +855,6 @@ def _close_position(pos: dict, close_price: float,
             except Exception as e:
                 logger.error(f"[OANDA] {pair} 決済失敗（{MAX_RETRY}回リトライ済み）: {e}")
 
-    # 戦績を更新
     stats = update_stats(pnl_pips, LOT)
 
     if LINE_OK:
@@ -797,7 +871,8 @@ def _close_position(pos: dict, close_price: float,
             total_pips=stats["total_pips"],
             balance=stats["balance"],
         )
-    clear_position()
+    remove_position(pos)   # 該当ポジションのみ削除（複数ポジション対応）
+
 
 # ─────────────────────────────────────────────────────────────
 # ▌ メインループ
@@ -805,13 +880,15 @@ def _close_position(pos: dict, close_price: float,
 def run():
     mode_label = "🔵 DRY RUN" if DRY_RUN else "🔴 本番"
     logger.info("=" * 55)
-    logger.info(f"  CatHack AI Trader 起動  [{mode_label}]")
+    logger.info(f"  FX Trade Luce 起動  [{mode_label}]")
+    logger.info(f"  監視ペア: {', '.join(PAIRS.values())}")
     logger.info(f"  チェック間隔: {LOOP_SEC}秒  ロット: {LOT:,}通貨")
-    logger.info(f"  BB: period={BB_PERIOD}, σ={BB_SIGMA}  SL:ATR×{BB_SL_MULT}  TP:ATR×{BB_TP_MULT}")
+    logger.info(f"  EMAクロス: EMA{EMA_FAST}/EMA{EMA_SLOW}  SL:ATR×{SL_MULT}  TP:ATR×{TP_MULT}")
+    logger.info(f"  H&S: buffer={HS_BUFFER_PIPS}pips  RR={HS_RR}")
     logger.info(f"  200SMA期間: {SMA_PERIOD}  リトライ: {MAX_RETRY}回")
+    logger.info(f"  建値移動: {BREAKEVEN_PIPS}pips超でSLを建値に移動")
     logger.info("=" * 55)
 
-    # 起動時ポジション照合（OANDA本番時のみ有効）
     sync_position()
 
     while True:
@@ -820,9 +897,9 @@ def run():
             now_jst = now_utc.astimezone(JST)
             logger.info(f"--- チェック開始: {now_jst.strftime('%Y/%m/%d %H:%M JST')} ---")
 
-            # ── ポジション管理（全ペア共通：1ポジションのみ保有） ──
-            pos = load_position()
-            if pos:
+            # ── 保有ポジションの管理（複数対応） ─────────────
+            active_positions = load_positions()
+            for pos in list(active_positions):
                 pair_name = pos.get("pair", "USD/JPY")
                 ticker    = next((t for t, n in PAIRS.items() if n == pair_name), "USDJPY=X")
                 try:
@@ -831,16 +908,36 @@ def run():
                     current_price = float(df_1h["Close"].iloc[-1])
                 except Exception as e:
                     logger.error(f"{pair_name} データ取得失敗（{MAX_RETRY}回リトライ済み）: {e}")
-                    time.sleep(60)
                     continue
-                logger.info(f"保有: {pair_name} {pos['direction']} @ {pos['entry_price']:.3f}  現在:{current_price:.3f}")
-                pos = manage_position(pos, current_price, now_jst)
-                if pos is None:
-                    logger.info("ポジション決済完了")
-                time.sleep(LOOP_SEC)
-                continue   # ポジションがあれば新規エントリーしない
 
-            # ── トレードフィルター ─────────────────────────
+                pnl_pips = (current_price - pos["entry_price"]) * 100 \
+                           if pos["direction"] == "BUY" \
+                           else (pos["entry_price"] - current_price) * 100
+                logger.info(
+                    f"保有: {pair_name} {pos['direction']} @ {pos['entry_price']:.3f}  "
+                    f"現在:{current_price:.3f}  含み損益:{pnl_pips:+.1f}pips"
+                )
+                updated = manage_position(pos, current_price, now_jst)
+                if updated is None:
+                    remove_position(pos)
+                    logger.info(f"[{pair_name}] ポジション決済完了")
+                else:
+                    # 建値移動などで更新された場合は保存し直す
+                    positions_all = load_positions()
+                    for p in positions_all:
+                        if (p.get("pair") == pos.get("pair") and
+                                p.get("entry_time") == pos.get("entry_time")):
+                            p.update(updated)
+                    save_positions(positions_all)
+
+            # 最大ポジション数に達していたら新規エントリーをスキップ
+            active_positions = load_positions()
+            if len(active_positions) >= MAX_POSITIONS:
+                logger.info(f"[ポジション上限] {len(active_positions)}/{MAX_POSITIONS} 保有中 — 新規エントリースキップ")
+                time.sleep(LOOP_SEC)
+                continue
+
+            # ── トレードフィルター ─────────────────────────────
             if tf:
                 filter_ok, filter_msg = tf.is_tradeable(now_jst, SPREAD_PIPS)
                 if not filter_ok:
@@ -848,7 +945,7 @@ def run():
                     time.sleep(LOOP_SEC)
                     continue
 
-            # ── 各ペアのシグナルチェック ──────────────────
+            # ── 各ペアのシグナルチェック ──────────────────────
             found_signal = False
             for ticker, pair_name in PAIRS.items():
                 try:
@@ -860,19 +957,28 @@ def run():
                     logger.error(f"{pair_name} データ取得失敗（{MAX_RETRY}回リトライ済み）: {e}")
                     continue
 
-                # BB逆張り（1h）→ H&S（4h）の順でチェック（SMAフィルター内蔵）
-                signal = check_bb_signal(df_1h)
-                if signal:
-                    logger.info(f"[BB/{pair_name}] {signal['action']}  {signal['reason']}")
-                else:
+                # USD/JPY: H&Sのみ（EMAクロスは廃止 — レンジ相場が多くダマシが多いため）
+                # GBP/JPY・EUR/JPY・AUD/JPY: EMAクロス+ADXのみ
+                HS_PAIRS  = {"USD/JPY"}
+                EMA_PAIRS = {"GBP/JPY", "EUR/JPY", "AUD/JPY"}
+                signal = None
+                if pair_name in HS_PAIRS:
                     signal = check_hs_signal(df_4h)
                     if signal:
                         logger.info(f"[H&S/{pair_name}] {signal['action']}  {signal['reason']}")
+                elif pair_name in EMA_PAIRS:
+                    signal = check_ema_signal(df_1h)
+                    if signal:
+                        logger.info(f"[EMA/{pair_name}] {signal['action']}  {signal['reason']}")
 
                 if signal:
-                    place_order(signal, now_jst, pair=pair_name)
-                    found_signal = True
-                    break   # 1ペアでシグナルが出たら他はスキップ
+                    active_positions = load_positions()
+                    if len(active_positions) < MAX_POSITIONS:
+                        place_order(signal, now_jst, pair=pair_name)
+                        found_signal = True
+                    else:
+                        logger.info(f"[ポジション上限] {pair_name} シグナルあり — "
+                                    f"最大{MAX_POSITIONS}ポジション保有中のためスキップ")
 
             if not found_signal:
                 logger.info("全ペア シグナルなし — 様子見")

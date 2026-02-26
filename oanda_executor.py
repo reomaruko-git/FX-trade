@@ -5,6 +5,8 @@ OandaExecutor クラスが提供するメソッド:
   - place_order(instrument, units, stop_loss, take_profit)
   - close_position(instrument)
   - get_open_positions() → list[dict]
+  - get_open_trade_id(instrument) → str | None
+  - replace_stop_loss(trade_id, new_price, instrument) → dict  ← 建値移動用
 
 環境変数（.env から読み込む）:
   OANDA_API_KEY       : アクセストークン
@@ -191,6 +193,69 @@ class OandaExecutor:
             })
 
         return result
+
+    # ──────────────────────────────────────────────────────────
+    # トレードID取得
+    # ──────────────────────────────────────────────────────────
+    def get_open_trade_id(self, instrument: str) -> str | None:
+        """
+        指定通貨ペアのオープントレードIDを返す。
+        建値移動（replace_stop_loss）で使用するトレードIDの取得に利用。
+
+        Parameters
+        ----------
+        instrument : 通貨ペア（例: "USD_JPY"）
+
+        Returns
+        -------
+        str のトレードID、見つからない場合は None
+        """
+        r = trades_ep.OpenTrades(self.account_id)
+        self.client.request(r)
+        for trade in r.response.get("trades", []):
+            if trade.get("instrument") == instrument:
+                trade_id = str(trade.get("id", ""))
+                logger.info(f"[OANDA] tradeID取得: {instrument} → {trade_id}")
+                return trade_id
+        return None
+
+    # ──────────────────────────────────────────────────────────
+    # ストップロス変更（建値移動）
+    # ──────────────────────────────────────────────────────────
+    def replace_stop_loss(
+        self,
+        trade_id: str,
+        new_price: float,
+        instrument: str = "",
+    ) -> dict:
+        """
+        既存トレードのストップロス価格を変更する（建値移動用）。
+
+        Parameters
+        ----------
+        trade_id   : 対象トレードのID（place_order のレスポンスから取得）
+        new_price  : 新しいストップロス価格
+        instrument : 通貨ペア（例: "USD_JPY"）。価格フォーマットの判定に使用。
+
+        Returns
+        -------
+        OANDA API のレスポンス dict
+        """
+        price_str = _price_fmt(instrument, new_price) if instrument else f"{new_price:.3f}"
+        data = {
+            "stopLoss": {
+                "price":       price_str,
+                "timeInForce": "GTC",
+            }
+        }
+        r = trades_ep.TradeCRCDO(self.account_id, tradeID=trade_id, data=data)
+        self.client.request(r)
+        resp = r.response
+        logger.info(
+            f"[OANDA] SL変更完了: tradeID={trade_id} 新SL={price_str}"
+            f" instrument={instrument or '?'}"
+        )
+        return resp
 
 
 # ──────────────────────────────────────────────────────────────

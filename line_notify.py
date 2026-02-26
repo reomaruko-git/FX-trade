@@ -333,7 +333,7 @@ if __name__ == "__main__":
     if args.test_line:
         print("接続テスト送信中...")
         ok = send_line(
-            f"🐱 CatHack AI Trader\n"
+            f"🌙 FX Trade Luce\n"
             f"━━━━━━━━━━━━\n"
             f"✅ LINE 接続テスト成功！\n"
             f"システムが正常に動作しています。\n"
@@ -351,7 +351,7 @@ if __name__ == "__main__":
     # ① 接続テスト
     print("① 接続テスト送信中...")
     send_line(
-        f"🐱 CatHack AI Trader\n"
+        f"🌙 FX Trade Luce\n"
         f"━━━━━━━━━━━━\n"
         f"✅ LINE 接続テスト成功！\n"
         f"システムが正常に動作しています。\n"

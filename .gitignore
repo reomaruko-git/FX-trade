@@ -6,3 +6,12 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+# バックテスト結果（大きくなるためgit管理外）
+backtest_results/
+
+# ログ・データファイル
+*.log
+*.log.*
+position.json
+trade_stats.json
