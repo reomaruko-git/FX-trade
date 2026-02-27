@@ -1,14 +1,14 @@
 """
 auto_trader.py — FX Trade Luce 司令塔
 ==========================================
-H&S（4時間足）を3通貨ペアで監視し、
+H&S（4時間足）を2通貨ペアで監視し、
 シグナルが出たら LINE 通知 → OANDA 発注（または DRY RUN ログ）。
 
 戦略:
-  USD/JPY: H&S（4時間足）  バックテスト: 70回, 34.3%, +1333 pips
-  EUR/JPY: H&S（4時間足）  バックテスト: 64回, 28.1%, +1023 pips
-  AUD/JPY: H&S（4時間足）  バックテスト: 60回, 55.0%, +2895 pips
-  ※ GBP/JPY は成績不良（17.6%, -22pips）のため除外
+  USD/JPY: H&S（4時間足）  バックテスト(OOS): 37回, 29.7%, +960 pips
+  AUD/JPY: H&S（4時間足）  バックテスト(OOS): 27回, 59.3%, +1488 pips
+  ※ GBP/JPY は除外（OOS: 7.7%勝率, -1000pips）
+  ※ EUR/JPY は除外（OOS: 22.0%勝率, -368pips — ウォークフォワード検証で過剰最適化確認）
   ※ EMAクロスは廃止（過剰シグナル・低勝率のため）
 
 H&S検出: backtest.pyと同ロジック統一
@@ -86,10 +86,10 @@ MAX_RETRY     = int(os.environ.get("MAX_RETRY", "3"))
 SMA_PERIOD    = int(os.environ.get("SMA_PERIOD", "200"))
 
 # 監視ペア: yfinance ticker → 表示名
-# ※ GBP/JPY は除外（バックテスト: 17.6%勝率, -22pips で成績不良）
+# ※ GBP/JPY は除外（OOS: 7.7%勝率, -1000pips で成績不良）
+# ※ EUR/JPY は除外（OOS: -368pips — ウォークフォワード検証で過剰最適化確認済み）
 PAIRS = {
     "USDJPY=X": "USD/JPY",
-    "EURJPY=X": "EUR/JPY",
     "AUDJPY=X": "AUD/JPY",
 }
 
