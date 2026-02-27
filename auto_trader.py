@@ -828,9 +828,12 @@ def manage_position(pos: dict, current_price: float, now_jst: datetime) -> dict 
     """
     ポジション管理:
       - SL / TP 到達チェック
-      - 週末強制クローズ（金曜 23:00 JST）
     ※ 建値移動（ブレークイーブン）は廃止
        → バックテストで「含み益トレードを0pipsで強制終了→負け計上」の悪影響が判明
+    ※ 週末強制クローズも廃止
+       → バックテスト検証で「含み益ポジションを途中で切る→利益を大幅に削る」と判明
+       → 金曜クローズあり: +2,262 pips vs なし: +5,004 pips（差 -2,742 pips）
+       → SL/TPのみで管理するのがバックテスト結果と一致する正しい設計
     """
     direction   = pos["direction"]
     entry_price = pos["entry_price"]
@@ -839,11 +842,6 @@ def manage_position(pos: dict, current_price: float, now_jst: datetime) -> dict 
 
     pnl_pips = (current_price - entry_price) * 100 if direction == "BUY" \
                else (entry_price - current_price) * 100
-
-    # ── 週末強制クローズ ──────────────────────────────────────
-    if now_jst.weekday() == 4 and now_jst.hour >= 23:
-        _close_position(pos, current_price, pnl_pips, "週末強制クローズ（金曜 23:00 JST）", now_jst)
-        return None
 
     # ── TP 到達 ────────────────────────────────────────────────
     tp_hit = (direction == "BUY"  and current_price >= tp) or \

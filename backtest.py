@@ -284,8 +284,27 @@ def backtest_ema(df_1h: pd.DataFrame, pair_name: str) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────
 # ▌ H&Sバックテスト
 # ─────────────────────────────────────────────────────────────
-def backtest_hs(df_4h: pd.DataFrame, pair_name: str) -> pd.DataFrame:
-    """H&S戦略をバックテスト（run_backtest.pyと同ロジック統一版）"""
+def _is_friday_close_bar(ts: pd.Timestamp) -> bool:
+    """
+    金曜 23:00 JST（= UTC 14:00）を含む4時間足かどうか判定。
+    yfinance の4時間足は UTC で 12:00 始まりの足が 12:00〜16:00 をカバーするため、
+    金曜 UTC 12:00 以降の足を強制決済対象とする。
+    """
+    # タイムゾーン付きに統一
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts.weekday() == 4 and ts.hour >= 12   # 4 = Friday
+
+
+def backtest_hs(df_4h: pd.DataFrame, pair_name: str,
+                friday_close: bool = False) -> pd.DataFrame:
+    """
+    H&S戦略をバックテスト（run_backtest.pyと同ロジック統一版）
+
+    friday_close=True: 金曜 23:00 JST（UTC 14:00）に未決済ポジションを強制決済
+                       ← auto_trader.py の週末クローズ機能と同じ挙動
+    friday_close=False: SL/TPのみで決済（デフォルト）
+    """
     sma_s       = calc_sma200(df_4h)
     atr_s       = calc_atr(df_4h)
     trades      = []
@@ -299,7 +318,7 @@ def backtest_hs(df_4h: pd.DataFrame, pair_name: str) -> pd.DataFrame:
         ts     = df_4h.index[i]
         sma200 = float(sma_s.iloc[i]) if not pd.isna(sma_s.iloc[i]) else close
 
-        # ── ポジション管理（ブレイクイーブンなし・run_backtest.pyと同じシンプル管理）──
+        # ── ポジション管理（ブレイクイーブンなし）────────────────
         if pos:
             direction   = pos["direction"]
             entry_price = pos["entry_price"]
@@ -308,6 +327,32 @@ def backtest_hs(df_4h: pd.DataFrame, pair_name: str) -> pd.DataFrame:
                      (direction == "SELL" and low  <= pos["tp"])
             sl_hit = (direction == "BUY"  and low  <= pos["sl"]) or \
                      (direction == "SELL" and high >= pos["sl"])
+
+            # 金曜強制決済チェック（SL/TP判定より先に行う）
+            fri_hit = friday_close and _is_friday_close_bar(ts)
+
+            if fri_hit and not tp_hit and not sl_hit:
+                # 強制決済: 終値で処理
+                exit_price = close
+                pnl_pips   = _pips(exit_price - entry_price) if direction == "BUY" \
+                             else _pips(entry_price - exit_price)
+                trades.append({
+                    "pair":        pair_name,
+                    "strategy":    "H&S",
+                    "direction":   direction,
+                    "entry_time":  pos["entry_time"],
+                    "exit_time":   ts,
+                    "entry_price": entry_price,
+                    "exit_price":  exit_price,
+                    "sl":          pos["sl_orig"],
+                    "tp":          pos["tp"],
+                    "pnl_pips":    pnl_pips,
+                    "pnl_jpy":     int(pnl_pips * LOT / 100),
+                    "result":      "WIN" if pnl_pips > 0 else "LOSS",
+                    "exit_reason": "FRIDAY_CLOSE",
+                })
+                pos = None
+                continue
 
             if tp_hit or sl_hit:
                 exit_price = pos["tp"] if tp_hit else pos["sl"]
@@ -329,6 +374,10 @@ def backtest_hs(df_4h: pd.DataFrame, pair_name: str) -> pd.DataFrame:
                     "exit_reason": "TP" if tp_hit else "SL",
                 })
                 pos = None
+            continue
+
+        # 金曜はエントリーしない（friday_close=True の場合）
+        if friday_close and _is_friday_close_bar(ts):
             continue
 
         # ── エントリー判定 ────────────────────────────────
@@ -461,12 +510,79 @@ def save_results(df: pd.DataFrame, summaries: list[dict]):
 # ─────────────────────────────────────────────────────────────
 # ▌ メイン
 # ─────────────────────────────────────────────────────────────
+def compare_friday_close(df_4h: pd.DataFrame, pair_name: str):
+    """金曜強制決済あり・なしを比較して差異を表示する"""
+    df_no  = backtest_hs(df_4h, pair_name, friday_close=False)
+    df_fri = backtest_hs(df_4h, pair_name, friday_close=True)
+
+    def _stats(df):
+        if df.empty:
+            return {"trades": 0, "win_rate": 0, "total_pips": 0, "total_jpy": 0,
+                    "max_dd_pct": 0, "avg_win": 0, "avg_loss": 0}
+        total  = len(df)
+        wins   = (df["result"] == "WIN").sum()
+        losses = total - wins
+        wr     = round(wins / total * 100, 1) if total > 0 else 0
+        pips   = round(df["pnl_pips"].sum(), 1)
+        jpy    = df["pnl_jpy"].sum()
+        aw     = round(df.loc[df["result"] == "WIN",  "pnl_pips"].mean(), 1) if wins   > 0 else 0.0
+        al     = round(df.loc[df["result"] == "LOSS", "pnl_pips"].mean(), 1) if losses > 0 else 0.0
+        bal    = INITIAL_BALANCE + df["pnl_jpy"].cumsum()
+        peak   = bal.cummax()
+        dd     = (bal - peak)
+        mdd    = round(dd.min() / peak[dd.idxmin()] * 100, 1) if not dd.empty else 0.0
+        fri_n  = (df["exit_reason"] == "FRIDAY_CLOSE").sum() if "exit_reason" in df.columns else 0
+        return {"trades": total, "wins": wins, "losses": losses,
+                "win_rate": wr, "total_pips": pips, "total_jpy": jpy,
+                "avg_win": aw, "avg_loss": al, "max_dd_pct": mdd, "fri_closes": fri_n}
+
+    s0 = _stats(df_no)
+    s1 = _stats(df_fri)
+
+    # 金曜決済のうち何勝何敗か
+    fri_trades = df_fri[df_fri["exit_reason"] == "FRIDAY_CLOSE"] if not df_fri.empty else pd.DataFrame()
+    fri_win  = (fri_trades["result"] == "WIN").sum()  if not fri_trades.empty else 0
+    fri_loss = (fri_trades["result"] == "LOSS").sum() if not fri_trades.empty else 0
+    fri_pips = round(fri_trades["pnl_pips"].sum(), 1)  if not fri_trades.empty else 0.0
+
+    w = 54
+    print(f"\n  {'─'*w}")
+    print(f"  【{pair_name}  金曜強制決済 比較】")
+    print(f"  {'─'*w}")
+    print(f"  {'項目':<20} {'なし（SL/TPのみ）':>15} {'あり（金曜23時）':>15}")
+    print(f"  {'─'*w}")
+    print(f"  {'トレード数':<20} {s0['trades']:>14}回 {s1['trades']:>14}回")
+    print(f"  {'勝率':<20} {s0['win_rate']:>13.1f}% {s1['win_rate']:>13.1f}%")
+    print(f"  {'累計損益(pips)':<20} {s0['total_pips']:>+14.1f} {s1['total_pips']:>+14.1f}")
+    print(f"  {'累計損益(円)':<20} {s0['total_jpy']:>+14,} {s1['total_jpy']:>+14,}")
+    print(f"  {'平均利益(pips)':<20} {s0['avg_win']:>+14.1f} {s1['avg_win']:>+14.1f}")
+    print(f"  {'平均損失(pips)':<20} {s0['avg_loss']:>+14.1f} {s1['avg_loss']:>+14.1f}")
+    print(f"  {'最大DD':<20} {s0['max_dd_pct']:>13.1f}% {s1['max_dd_pct']:>13.1f}%")
+    print(f"  {'─'*w}")
+
+    # 差分表示
+    diff_pips = s1["total_pips"] - s0["total_pips"]
+    diff_jpy  = s1["total_jpy"]  - s0["total_jpy"]
+    sign_p = "+" if diff_pips >= 0 else ""
+    sign_j = "+" if diff_jpy  >= 0 else ""
+    verdict = "✅ 金曜クローズは有利" if diff_pips > 0 else "⚠️ 金曜クローズは不利" if diff_pips < 0 else "→ 差なし"
+    print(f"  差分（あり − なし）: {sign_p}{diff_pips:.1f} pips  ({sign_j}{diff_jpy:,}円)  {verdict}")
+
+    if s1["fri_closes"] > 0:
+        print(f"  金曜決済の内訳      : {s1['fri_closes']}回（{fri_win}勝 {fri_loss}敗）  "
+              f"合計 {fri_pips:+.1f} pips")
+
+    return df_no, df_fri, s0, s1
+
+
 def main():
     parser = argparse.ArgumentParser(description="FX Trade Luce バックテスト")
     parser.add_argument("--pair",     default="all",
                         help="USDJPY / GBPJPY / all（デフォルト: all）")
     parser.add_argument("--strategy", default="all",
                         help="ema / hs / all（デフォルト: all）")
+    parser.add_argument("--friday-compare", action="store_true",
+                        help="金曜強制決済あり・なしを比較モードで実行")
     args = parser.parse_args()
 
     run_ema = args.strategy in ("ema", "all")
@@ -479,13 +595,49 @@ def main():
         key = args.pair.upper() + "=X"
         target_pairs = {key: PAIRS[key]} if key in PAIRS else PAIRS
 
-    print("=" * 55)
+    print("=" * 60)
     print("  FX Trade Luce バックテスト開始")
     print(f"  対象ペア: {', '.join(target_pairs.values())}")
     print(f"  戦略   : {'EMAクロス ' if run_ema else ''}{'H&S' if run_hs else ''}")
     print(f"  初期資金: {INITIAL_BALANCE:,}円  ロット: {LOT:,}通貨")
-    print("=" * 55)
+    if args.friday_compare:
+        print("  モード  : 金曜強制決済 比較モード")
+    print("=" * 60)
 
+    # ── 金曜比較モード ──────────────────────────────────────────
+    if args.friday_compare and run_hs:
+        all_no, all_fri = [], []
+        for ticker, pair_name in target_pairs.items():
+            print(f"\n▶ {pair_name}  データ取得中...")
+            try:
+                df_1h, df_4h = fetch_data(ticker)
+            except Exception as e:
+                print(f"  ❌ 取得失敗: {e}")
+                continue
+            if pair_name not in {"USD/JPY", "GBP/JPY", "EUR/JPY", "AUD/JPY"}:
+                continue
+            df_no, df_fri, _, _ = compare_friday_close(df_4h, pair_name)
+            all_no.append(df_no)
+            all_fri.append(df_fri)
+
+        # 全ペア合計比較
+        print("\n" + "=" * 60)
+        print("  【全ペア合計 比較】")
+        def _total_summary(dfs, label):
+            combined = pd.concat([d for d in dfs if not d.empty], ignore_index=True) \
+                       if any(not d.empty for d in dfs) else pd.DataFrame()
+            if combined.empty:
+                print(f"  [{label}] トレードなし")
+                return
+            summarize(combined, label)
+        print("\n  ▼ 金曜クローズなし（SL/TPのみ）:")
+        _total_summary(all_no,  "全ペア SL/TPのみ")
+        print("\n  ▼ 金曜クローズあり（金曜23時強制決済）:")
+        _total_summary(all_fri, "全ペア 金曜クローズ")
+        print("\n✅ 比較完了！")
+        return
+
+    # ── 通常モード ──────────────────────────────────────────────
     all_trades  = []
     all_summaries = []
 
@@ -497,8 +649,6 @@ def main():
             print(f"  ❌ データ取得失敗: {e}")
             continue
 
-        # EMAクロスはGBP/JPY・EUR/JPY・AUD/JPY（USD/JPYはH&Sのみ）
-        # ※ EMA21/55 + 4h は取引数が少なすぎるため現在無効化中
         EMA_PAIRS: set = set()  # 全ペア無効化（H&Sに統一）
         if run_ema and pair_name in EMA_PAIRS:
             print(f"\n  [EMAクロス 4h] バックテスト中...")
@@ -507,7 +657,6 @@ def main():
             all_trades.append(df_ema)
             all_summaries.append(s)
 
-        # H&Sを全ペアに適用（run_backtest.pyで実証済みの検出ロジック）
         HS_PAIRS = {"USD/JPY", "GBP/JPY", "EUR/JPY", "AUD/JPY"}
         if run_hs and pair_name in HS_PAIRS:
             print(f"\n  [H&S] バックテスト中...")
@@ -520,7 +669,7 @@ def main():
     if all_trades:
         combined = pd.concat([df for df in all_trades if not df.empty], ignore_index=True)
         if not combined.empty:
-            print("\n" + "=" * 55)
+            print("\n" + "=" * 60)
             summarize(combined, "全戦略合計")
             save_results(combined, all_summaries)
     else:
