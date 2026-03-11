@@ -1,6 +1,6 @@
 # FX Trade Luce — 現場仕様書
 
-> 最終更新: 2026-02-27（ウォークフォワード検証でEUR/JPY過剰最適化確認 → 2ペア体制に変更）
+> 最終更新: 2026-03-10（約定価格バグ修正・OANDA実残高通知・キャンセル検知追加）
 
 ---
 
@@ -12,7 +12,7 @@ FX-trade/
 ├── backtest.py          # 4ペア長期バックテスト（2年分・4時間足）
 ├── run_backtest.py      # 単一ペア・複数戦略の比較検証スクリプト
 ├── verify_top2.py       # H&S / BB+RSI 詳細検証・パラメータ感度テスト
-├── oanda_executor.py    # OANDA v3 API ラッパー（発注・決済・SL変更・ポジション取得）
+├── oanda_executor.py    # OANDA v3 API ラッパー（発注・決済・SL変更・ポジション取得・口座サマリー）
 ├── market_analyzer.py   # 相場分析エンジン（ダッシュボード用）
 ├── line_notify.py       # LINE通知モジュール（グループ対応）
 ├── trade_filter.py      # トレードフィルター（スプレッド・重要指標）
@@ -127,6 +127,8 @@ H&S 戦略に適用。
 |------|------|
 | 同時保有上限 | 最大2ポジション（全ペア合計） |
 | trade_id管理 | 発注時にOANDAのtradeIDを取得・保存し、ポジション復元に使用 |
+| **約定価格の記録** | **発注後にOANDAレスポンスから実際の約定価格（fill_price）を取得。positions.json の `entry_price` および LINE通知に使用（シグナル価格≠約定価格のズレを解消）** |
+| **キャンセル検知** | **`orderFillTransaction` がない場合はキャンセル/リジェクトと判定。LINEエラー通知を送り、positions.jsonには追加しない（幽霊ポジション防止）** |
 | ブレイクイーブン | **廃止**（バックテストで「含み益を0pipsで強制終了→負け計上」の悪影響が判明） |
 | 週末クローズ | **廃止**（バックテスト検証で「含み益ポジションを途中で切る→利益を大幅に削る」と判明。金曜クローズあり: +2,262 pips vs なし: +5,004 pips） |
 
@@ -165,7 +167,7 @@ H&S 戦略に適用。
 🇺🇸🇯🇵 USD/JPY  (売)
 --------------------
 🏁 決済 : 148.150
-🛫 始値 : 150.250
+🛫 始値 : 150.250        ← OANDA実約定価格
 --------------------
 📊 損益 : +210.5 pips ✨
 💰 収支 : +42,100円
@@ -174,10 +176,12 @@ H&S 戦略に適用。
 📈 【運用実績】
 📅 本日合計 : +210.5 pips  (計 +42,100円)
 🏆 全期間   : +210.5 pips
-💰 口座残高 : 542,100円
+💰 口座残高 : 542,100円   ← OANDAのNAV（純資産額）実値。スワップ・含み損益込み
 ────────────────────
 📅 2026/02/26 14:30 JST
 ```
+
+> 口座残高は決済後にOANDA APIから取得したNAV（Net Asset Value）を使用。スワップ・含み損益をすべて含む正確な値。取得失敗時はローカル推計値にフォールバック。
 
 ### エラー通知（notify_error）
 
@@ -245,11 +249,20 @@ auto_trader.py
   └─ place_order()
        └─ OandaExecutor.place_order(instrument, units, stop_loss, take_profit)
             └─ OANDA v3 API: POST /v3/accounts/{id}/orders
-                 └─ MarketOrder + SL/TP 同時設定 → tradeID を取得・保存
+                 └─ MarketOrder + SL/TP 同時設定
+                      ├─ orderFillTransaction あり → 約定確認
+                      │    ├─ 実際の約定価格（fill_price）を取得
+                      │    ├─ tradeID を保存
+                      │    └─ LINE通知・positions.json に約定価格を記録
+                      └─ orderFillTransaction なし → キャンセル/リジェクト判定
+                           └─ LINEエラー通知を送信・positions.jsonには追加しない
 
   └─ _close_position()
        └─ OandaExecutor.close_position(instrument)
             └─ OANDA v3 API: PUT /v3/accounts/{id}/positions/{instrument}/close
+       └─ OandaExecutor.get_account_summary()
+            └─ OANDA v3 API: GET /v3/accounts/{id}/summary
+                 └─ NAV（純資産額）を取得して決済通知の口座残高に使用
 ```
 
 > 建値移動（`replace_stop_loss`）は廃止のため、SL更新APIは使用しない。
@@ -278,6 +291,7 @@ auto_trader.py
 | リトライ | API失敗時に最大MAX_RETRY回（デフォルト3回）、60秒待機して再試行 |
 | 例外処理 | メインループ全体をtry-exceptで囲み、想定外エラーでも停止しない |
 | ポジション照合 | 起動時にOANDA APIとpositions.jsonを照合、ズレがあればAPI側を正として修正（本番モードのみ） |
+| **キャンセル検知** | **発注レスポンスに`orderFillTransaction`がない場合はキャンセル/リジェクトと判定してLINEエラー通知。positions.jsonへの追加をスキップし幽霊ポジションを防ぐ** |
 | verbose抑制 | pandas_taのstdout出力を`_quiet()`で抑制し、ログを見やすく保つ |
 | ログローテーション | `RotatingFileHandler` により1MBで自動切り替え、最大5世代（合計~6MB）保持 |
 

@@ -24,6 +24,7 @@ import oandapyV20.endpoints.orders      as orders
 import oandapyV20.endpoints.positions   as pos_ep
 import oandapyV20.endpoints.trades      as trades_ep
 import oandapyV20.endpoints.instruments as instr_ep
+import oandapyV20.endpoints.accounts   as accounts_ep
 from oandapyV20.contrib.requests import (
     MarketOrderRequest,
     TakeProfitDetails,
@@ -277,6 +278,38 @@ class OandaExecutor:
         return df
 
     # ──────────────────────────────────────────────────────────
+    # 口座サマリー取得
+    # ──────────────────────────────────────────────────────────
+    def get_account_summary(self) -> dict:
+        """
+        OANDA 口座の残高・損益・スワップ等を取得して返す。
+
+        Returns
+        -------
+        dict:
+          balance       : 口座残高（確定済み）
+          nav           : 純資産額（残高 + 含み損益）
+          unrealized_pl : 未実現損益（含み損益）
+          realized_pl   : 実現済み損益（累計）
+          financing     : スワップ累計（マイナス = 支払い超過）
+          open_trades   : オープントレード数
+          currency      : 口座通貨（例: "JPY"）
+        """
+        r = accounts_ep.AccountSummary(self.account_id)
+        self.client.request(r)
+        a = r.response.get("account", {})
+
+        return {
+            "balance":       float(a.get("balance",       0)),
+            "nav":           float(a.get("NAV",           0)),
+            "unrealized_pl": float(a.get("unrealizedPL",  0)),
+            "realized_pl":   float(a.get("pl",            0)),
+            "financing":     float(a.get("financing",     0)),
+            "open_trades":   int(a.get("openTradeCount",  0)),
+            "currency":      a.get("currency", "JPY"),
+        }
+
+    # ──────────────────────────────────────────────────────────
     # ストップロス変更（建値移動）
     # ──────────────────────────────────────────────────────────
     def replace_stop_loss(
@@ -314,6 +347,37 @@ class OandaExecutor:
         )
         return resp
 
+    # ──────────────────────────────────────────────────────────
+    # トレード詳細取得（外部決済検知用）
+    # ──────────────────────────────────────────────────────────
+    def get_trade_details(self, trade_id: str) -> dict:
+        """
+        指定 tradeID の詳細を取得。OPEN / CLOSED どちらでも取得可能。
+
+        Returns
+        -------
+        dict:
+            state        : "OPEN" | "CLOSED" | "CANCELLED"
+            close_price  : float  （CLOSED の場合）
+            close_reason : str    （"SL" | "TP" | "手動" | "不明"）
+        """
+        r = trades_ep.TradeDetails(self.account_id, tradeID=trade_id)
+        self.client.request(r)
+        trade = r.response.get("trade", {})
+        state = trade.get("state", "OPEN")
+
+        result: dict = {"state": state}
+        if state == "CLOSED":
+            result["close_price"] = float(trade.get("averageClosePrice", 0))
+            # 決済理由を推定
+            if trade.get("stopLossOrderID"):
+                result["close_reason"] = "SL"
+            elif trade.get("takeProfitOrderID"):
+                result["close_reason"] = "TP"
+            else:
+                result["close_reason"] = "手動"
+        return result
+
 
 # ──────────────────────────────────────────────────────────────
 # 動作確認用（python3 oanda_executor.py で実行）
@@ -322,14 +386,32 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     try:
         ex = OandaExecutor()
+
+        # ── 口座サマリー ──────────────────────────────────────
+        summary = ex.get_account_summary()
+        cur = summary["currency"]
+        print(f"\n{'='*50}")
+        print("  OANDA 口座サマリー")
+        print(f"{'='*50}")
+        print(f"  口座残高（確定済み） : {summary['balance']:>12,.0f} {cur}")
+        print(f"  純資産額（NAV）      : {summary['nav']:>12,.0f} {cur}  ← 含み損益込み")
+        print(f"  含み損益             : {summary['unrealized_pl']:>+12,.0f} {cur}")
+        print(f"  実現済み損益（累計） : {summary['realized_pl']:>+12,.0f} {cur}")
+        print(f"  スワップ累計         : {summary['financing']:>+12,.0f} {cur}")
+        print(f"  オープントレード数   : {summary['open_trades']} 件")
+        print(f"{'='*50}")
+
+        # ── オープンポジション ───────────────────────────────
         positions = ex.get_open_positions()
         if positions:
-            print(f"\n✅ オープンポジション ({len(positions)}件):")
+            print(f"\n  オープンポジション ({len(positions)}件):")
             for p in positions:
                 direction = "BUY" if p["units"] > 0 else "SELL"
                 print(f"  {p['pair']}  {direction}  {abs(p['units']):,.0f}通貨"
                       f"  @ {p['entry_price']:.3f}")
         else:
-            print("\n✅ 接続成功！現在オープンポジションはありません。")
+            print("\n  現在オープンポジションはありません。")
+        print()
+
     except Exception as e:
         print(f"\n❌ エラー: {e}")

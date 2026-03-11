@@ -9,22 +9,16 @@ H&S（4時間足）を2通貨ペアで監視し、
   AUD/JPY: H&S（4時間足）  バックテスト(OOS): 27回, 59.3%, +1488 pips
   ※ GBP/JPY は除外（OOS: 7.7%勝率, -1000pips）
   ※ EUR/JPY は除外（OOS: 22.0%勝率, -368pips — ウォークフォワード検証で過剰最適化確認）
-  ※ EMAクロスは廃止（過剰シグナル・低勝率のため）
 
-H&S検出: backtest.pyと同ロジック統一
+H&S検出: technical.py の detect_hs_window を使用（backtest.py と共通ロジック）
   - 直近100本窓・全組み合わせ探索（distance=5, tol=0.020）
   - TP: ネックライン倍返し（head - neckline の距離をネックラインから延長）
-  - SL: 右肩高値（低値）+ 1pip バッファ
+  - SL: 右肩高値（低値）+ バッファ
   - MAX_SL_PIPS=80（4h足の自然なSL幅に対応）
 
 テクニカル計算: pandas_ta
-H&S検知      : scipy.signal.find_peaks
 
 起動方法:
-    # ドライランモード（デフォルト）
-    python3 auto_trader.py
-
-    # 本番モード（.env に DRY_RUN=false 設定済みの場合）
     python3 auto_trader.py
 
 停止: Ctrl+C
@@ -42,19 +36,9 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import contextlib
-import io
-
 import pandas as pd
 import numpy as np
-import pandas_ta as ta
-from scipy.signal import find_peaks
-
-
-def _quiet(func, *args, **kwargs):
-    """pandas_ta の verbose 出力を抑制して関数を実行する"""
-    with contextlib.redirect_stdout(io.StringIO()):
-        return func(*args, **kwargs)
+from technical import _quiet, detect_hs_window
 
 # ─────────────────────────────────────────────────────────────
 # ▌ .env 読み込み
@@ -100,11 +84,13 @@ HS_BUFFER_PIPS = 0.05   # H&S 右肩からのバッファ距離（5pips）
 ADX_PERIOD     = 14     # ADX 計算期間（参考情報としてログ出力）
 MAX_POSITIONS  = 2      # 最大同時保有ポジション数
 
+# シグナル重複発火防止: 同一シグナル（ペア+方向+SL+TP）が連続で出た場合のクールダウン
+# dict[pair_name] = {"key": "BUY_157.332_159.422", "count": 3}
+_signal_cooldown: dict = {}
+
 # ── SL / TP ──────────────────────────────────────────────────
-# EMA用（互換性のため残す）
-SL_MULT        = 2.0
-TP_MULT        = 4.0
 MAX_SL_PIPS    = 80    # SL上限（pips）。50→80に拡張（4h足基準に合わせる）
+MIN_ENTRY_SL_PIPS = 20  # エントリー時の最低SL距離（pips）。これ未満は即ストップ回避のためスキップ
 
 # ─────────────────────────────────────────────────────────────
 # ▌ ロガー
@@ -336,7 +322,7 @@ def fetch_data(ticker: str, pair_name: str = "") -> tuple[pd.DataFrame, pd.DataF
 # ▌ テクニカル計算（pandas_ta 使用）
 # ─────────────────────────────────────────────────────────────
 def calc_ema(df: pd.DataFrame, period: int) -> pd.Series:
-    """EMA（pandas_ta）"""
+    """EMA（pandas_ta）。check_hs_signal では未使用だが fetch_data 等の将来利用のため残す"""
     return _quiet(df.ta.ema, length=period, append=False)
 
 
@@ -366,201 +352,18 @@ def calc_sma200(df: pd.DataFrame, period: int = SMA_PERIOD) -> float:
 
 
 # ─────────────────────────────────────────────────────────────
-# ▌ H&S パターン検知（backtest.py と完全統一ロジック）
+# ▌ H&S パターン検知（technical.py の共通ロジックを使用）
 # ─────────────────────────────────────────────────────────────
 def detect_hs(df: pd.DataFrame,
               distance: int = HS_DISTANCE,
               tol: float = HS_TOL) -> dict | None:
-    """
-    直近100本窓・全組み合わせ探索でH&Sパターンを検知する。
-    backtest.py の detect_hs_at と同ロジック。
-
-    戻り値:
-        {
-          "pattern":             "HEAD_AND_SHOULDERS" | "INV_HEAD_AND_SHOULDERS",
-          "right_shoulder_high": float,
-          "right_shoulder_low":  float,   # INV_H&S のみ
-          "head":                float,
-          "neckline":            float,
-        }
-        or None
-    """
-    # 直近100本を使用（backtest.pyと同じ窓サイズ）
-    window = df.tail(100)
-    if len(window) < distance * 3:
-        return None
-
-    highs = window["High"].values
-    lows  = window["Low"].values
-    n     = len(highs)
-
-    # ── 天井 H&S（3つのピーク：左肩 < 頭 > 右肩、左肩 ≈ 右肩） ─────
-    peak_idx, _ = find_peaks(highs, distance=distance)
-    if len(peak_idx) >= 3:
-        # 全組み合わせを新しい順に探索（backtest.pyと同じ）
-        for k in range(len(peak_idx) - 3, -1, -1):
-            ls_i = int(peak_idx[k])
-            hd_i = int(peak_idx[k + 1])
-            rs_i = int(peak_idx[k + 2])
-            ls, head, rs = highs[ls_i], highs[hd_i], highs[rs_i]
-
-            # 右肩が古すぎる場合はスキップ
-            if rs_i < n - distance * 4:
-                continue
-            # 頭が両肩より高くないとNG
-            if head <= max(ls, rs):
-                continue
-            # 肩の対称性チェック
-            if abs(ls - rs) / (head + 1e-9) > tol:
-                continue
-
-            # ネックライン: 左肩〜頭、頭〜右肩 間の最安値の平均
-            neck1    = float(lows[ls_i:hd_i].min()) if hd_i > ls_i else float(lows[ls_i])
-            neck2    = float(lows[hd_i:rs_i].min()) if rs_i > hd_i else float(lows[hd_i])
-            neckline = round((neck1 + neck2) / 2, 3)
-
-            # 右肩の高値（ピーク周辺の最高値）
-            buf      = max(1, distance // 2)
-            rs_high  = float(highs[max(0, rs_i - buf): rs_i + buf + 1].max())
-
-            return {
-                "pattern":             "HEAD_AND_SHOULDERS",
-                "right_shoulder_high": rs_high,
-                "head":                float(head),
-                "neckline":            neckline,
-            }
-
-    # ── 逆 H&S（3つのトラフ：左肩 > 頭 < 右肩、左肩 ≈ 右肩） ──────
-    trough_idx, _ = find_peaks(-lows, distance=distance)
-    if len(trough_idx) >= 3:
-        for k in range(len(trough_idx) - 3, -1, -1):
-            ls_i = int(trough_idx[k])
-            hd_i = int(trough_idx[k + 1])
-            rs_i = int(trough_idx[k + 2])
-            ls, head, rs = lows[ls_i], lows[hd_i], lows[rs_i]
-
-            if rs_i < n - distance * 4:
-                continue
-            if head >= min(ls, rs):
-                continue
-            if abs(ls - rs) / (abs(head) + 1e-9) > tol:
-                continue
-
-            neck1    = float(highs[ls_i:hd_i].max()) if hd_i > ls_i else float(highs[ls_i])
-            neck2    = float(highs[hd_i:rs_i].max()) if rs_i > hd_i else float(highs[hd_i])
-            neckline = round((neck1 + neck2) / 2, 3)
-
-            buf      = max(1, distance // 2)
-            rs_low   = float(lows[max(0, rs_i - buf): rs_i + buf + 1].min())
-            rs_high  = float(highs[rs_i])
-
-            return {
-                "pattern":             "INV_HEAD_AND_SHOULDERS",
-                "right_shoulder_high": rs_high,
-                "right_shoulder_low":  rs_low,
-                "head":                float(head),
-                "neckline":            neckline,
-            }
-
-    return None
+    """直近100本でH&Sパターンを検知。コアロジックは technical.detect_hs_window"""
+    return detect_hs_window(df.tail(100), distance=distance, tol=tol)
 
 
 # ─────────────────────────────────────────────────────────────
 # ▌ シグナル判定
 # ─────────────────────────────────────────────────────────────
-def check_ema_signal(df_1h: pd.DataFrame) -> dict | None:
-    """
-    EMAクロス（1h）シグナルチェック。
-    EMA9 が EMA21 を上抜け → BUY（SMA200より上）
-    EMA9 が EMA21 を下抜け → SELL（SMA200より下）
-    SL = ATR × SL_MULT、TP = ATR × TP_MULT（RR 1:2）
-    """
-    if len(df_1h) < max(EMA_SLOW, SMA_PERIOD) + 5:
-        return None
-
-    ema_fast  = calc_ema(df_1h, EMA_FAST)
-    ema_slow  = calc_ema(df_1h, EMA_SLOW)
-    if ema_fast is None or ema_slow is None:
-        return None
-
-    close        = float(df_1h["Close"].iloc[-1])
-    atr          = calc_atr(df_1h)
-    atr_pips     = round(atr * 100, 1)
-    sma200       = calc_sma200(df_1h)
-    above_sma200 = close > sma200
-    adx          = calc_adx(df_1h, ADX_PERIOD)
-
-    # ADXフィルター：トレンドが弱い横ばい相場はスキップ
-    if adx < ADX_MIN:
-        logger.info(f"[ADXフィルター] ADX={adx:.1f} < {ADX_MIN} — 横ばい相場のためスキップ")
-        return None
-
-    # 現在足と1本前でクロス判定
-    ef_now  = float(ema_fast.iloc[-1])
-    es_now  = float(ema_slow.iloc[-1])
-    ef_prev = float(ema_fast.iloc[-2])
-    es_prev = float(ema_slow.iloc[-2])
-
-    sl_basis = f"ATR×{SL_MULT} (ATR={atr_pips:.1f}pips)"
-    tp_basis = f"ATR×{TP_MULT} (RR 1:{int(TP_MULT / SL_MULT)})"
-
-    # ── ゴールデンクロス → BUY ───────────────────────────────
-    golden_cross = (ef_prev <= es_prev) and (ef_now > es_now)
-    if golden_cross:
-        if not above_sma200:
-            logger.info(f"[SMAフィルター] EMA/BUYシグナル → SMA200({sma200:.3f})より下のためスキップ")
-            return None
-        sl      = round(close - atr * SL_MULT, 3)
-        tp      = round(close + atr * TP_MULT, 3)
-        sl_pips = abs(close - sl) * 100
-        if sl_pips > MAX_SL_PIPS:
-            logger.info(f"[SLキャップ] EMA/BUY SL={sl_pips:.1f}pips > 上限{MAX_SL_PIPS}pipsのためスキップ")
-            return None
-        return {
-            "action":      "BUY",
-            "strategy":    f"EMAクロス 1h (EMA{EMA_FAST}/EMA{EMA_SLOW})",
-            "reason":      (
-                f"ゴールデンクロス EMA{EMA_FAST}({ef_now:.3f})>EMA{EMA_SLOW}({es_now:.3f}), "
-                f"SMA200={sma200:.3f}より上 | "
-                f"🛑 SL根拠: {sl_basis} | 🎯 TP根拠: {tp_basis}"
-            ),
-            "price":       close,
-            "stop_loss":   sl,
-            "take_profit": tp,
-            "sl_basis":    sl_basis,
-            "tp_basis":    tp_basis,
-        }
-
-    # ── デッドクロス → SELL ──────────────────────────────────
-    dead_cross = (ef_prev >= es_prev) and (ef_now < es_now)
-    if dead_cross:
-        if above_sma200:
-            logger.info(f"[SMAフィルター] EMA/SELLシグナル → SMA200({sma200:.3f})より上のためスキップ")
-            return None
-        sl      = round(close + atr * SL_MULT, 3)
-        tp      = round(close - atr * TP_MULT, 3)
-        sl_pips = abs(close - sl) * 100
-        if sl_pips > MAX_SL_PIPS:
-            logger.info(f"[SLキャップ] EMA/SELL SL={sl_pips:.1f}pips > 上限{MAX_SL_PIPS}pipsのためスキップ")
-            return None
-        return {
-            "action":      "SELL",
-            "strategy":    f"EMAクロス 1h (EMA{EMA_FAST}/EMA{EMA_SLOW})",
-            "reason":      (
-                f"デッドクロス EMA{EMA_FAST}({ef_now:.3f})<EMA{EMA_SLOW}({es_now:.3f}), "
-                f"SMA200={sma200:.3f}より下 | "
-                f"🛑 SL根拠: {sl_basis} | 🎯 TP根拠: {tp_basis}"
-            ),
-            "price":       close,
-            "stop_loss":   sl,
-            "take_profit": tp,
-            "sl_basis":    sl_basis,
-            "tp_basis":    tp_basis,
-        }
-
-    return None
-
-
 def check_hs_signal(df_4h: pd.DataFrame) -> dict | None:
     """
     H&S（4h）シグナルチェック。
@@ -749,21 +552,11 @@ def place_order(signal: dict, now_jst: datetime, pair: str = "USD/JPY") -> dict 
     trade_id   = ""
 
     if sl is None or tp is None:
-        logger.warning("[place_order] SL/TPがシグナルに含まれていません。ATRフォールバックを使用。")
-        import yfinance as yf
-        ticker = pair.replace("/", "").replace("_", "") + "=X"
-        try:
-            _raw = yf.download(ticker, period="30d", interval="1h",
-                               progress=False, auto_adjust=True)
-            if isinstance(_raw.columns, pd.MultiIndex):
-                _raw.columns = _raw.columns.get_level_values(0)
-            atr_fb = calc_atr(_raw)
-        except Exception:
-            atr_fb = 0.5
-        sl = round(price - atr_fb * BB_SL_MULT if action == "BUY"
-                   else price + atr_fb * BB_SL_MULT, 3)
-        tp = round(price + atr_fb * BB_TP_MULT if action == "BUY"
-                   else price - atr_fb * BB_TP_MULT, 3)
+        logger.error("[place_order] SL/TPがシグナルに含まれていません。発注をスキップします。")
+        return None
+
+    # fill_price: 実際の約定価格（DRY_RUNはシグナル価格をそのまま使用）
+    fill_price = price
 
     if DRY_RUN:
         logger.info(f"[DRY RUN] {pair} {action} @ {price:.3f}  SL:{sl:.3f}  TP:{tp:.3f}  "
@@ -779,14 +572,38 @@ def place_order(signal: dict, now_jst: datetime, pair: str = "USD/JPY") -> dict 
                     take_profit=tp,
                     label="place_order",
                 )
-                # tradeID を取得（建値移動で使用）
-                trade_id = (
-                    str(resp.get("orderFillTransaction", {})
-                              .get("tradeOpened", {})
-                              .get("tradeID", ""))
-                    or str(resp.get("relatedTransactionIDs", [""])[0])
+
+                # ── 約定確認 ──────────────────────────────────────
+                # orderFillTransaction がない = 約定せずキャンセル・リジェクト
+                fill_tx = resp.get("orderFillTransaction", {})
+                if not fill_tx:
+                    cancel_reason = (
+                        resp.get("orderCancelTransaction", {}).get("reason", "不明")
+                        or resp.get("orderRejectTransaction", {}).get("rejectReason", "不明")
+                    )
+                    logger.error(
+                        f"[OANDA] 注文が約定しませんでした ({pair} {action})  "
+                        f"理由: {cancel_reason}  レスポンス: {resp}"
+                    )
+                    if LINE_OK:
+                        notify_error(
+                            f"{pair} 注文キャンセル/リジェクト\n理由: {cancel_reason}"
+                        )
+                    return None  # positions.json には追加しない
+
+                # 実際の約定価格・tradeID を取得
+                trade_opened = fill_tx.get("tradeOpened", {})
+                trade_id     = str(trade_opened.get("tradeID", "")
+                                   or resp.get("relatedTransactionIDs", [""])[0])
+                fill_price   = float(fill_tx.get("price", price))  # 実約定価格
+
+                slippage_pips = round(abs(fill_price - price) * 100, 1)
+                logger.info(
+                    f"[OANDA] 約定確認: {pair} {action} "
+                    f"シグナル:{price:.3f} → 約定:{fill_price:.3f}  "
+                    f"スリッページ:{slippage_pips:+.1f}pips  tradeID={trade_id}"
                 )
-                logger.info(f"[OANDA] 発注成功: {pair} {action} @ {price:.3f}  tradeID={trade_id}")
+
             except Exception as e:
                 logger.error(f"[OANDA] 発注失敗（{MAX_RETRY}回リトライ済み）: {e}")
                 if LINE_OK:
@@ -796,7 +613,7 @@ def place_order(signal: dict, now_jst: datetime, pair: str = "USD/JPY") -> dict 
     if LINE_OK:
         notify_entry(
             direction=action,
-            price=price,
+            price=fill_price,       # 実際の約定価格を通知
             stop_loss=sl,
             take_profit=tp,
             strategy=signal["strategy"],
@@ -809,7 +626,8 @@ def place_order(signal: dict, now_jst: datetime, pair: str = "USD/JPY") -> dict 
         "active":         True,
         "pair":           pair,
         "direction":      action,
-        "entry_price":    price,
+        "entry_price":    fill_price,   # 実際の約定価格で記録
+        "signal_price":   price,        # シグナル検知価格（参考用）
         "stop_loss":      sl,
         "take_profit":    tp,
         "strategy":       signal["strategy"],
@@ -882,6 +700,17 @@ def _close_position(pos: dict, close_price: float,
 
     stats = update_stats(pnl_pips, LOT)
 
+    # OANDA の実際の口座残高（NAV）を取得して通知に使う
+    # DRY_RUN や接続なしの場合はローカル推計値にフォールバック
+    oanda_balance = stats["balance"]
+    if not DRY_RUN and oanda:
+        try:
+            acct = oanda.get_account_summary()
+            oanda_balance = int(acct["nav"])   # NAV = 残高 + 含み損益（スワップ込み）
+            logger.info(f"[OANDA] 口座残高取得: NAV={oanda_balance:,}円")
+        except Exception as e:
+            logger.warning(f"[OANDA] 口座残高取得失敗（ローカル推計値を使用）: {e}")
+
     if LINE_OK:
         notify_close(
             direction=direction,
@@ -894,7 +723,7 @@ def _close_position(pos: dict, close_price: float,
             daily_pips=stats["daily_pips"],
             daily_jpy=stats["daily_jpy"],
             total_pips=stats["total_pips"],
-            balance=stats["balance"],
+            balance=oanda_balance,   # OANDA実残高（NAV）
         )
     remove_position(pos)   # 該当ポジションのみ削除（複数ポジション対応）
 
@@ -912,7 +741,7 @@ def run():
     logger.info(f"  H&S: distance={HS_DISTANCE}  tol={HS_TOL}  buffer={HS_BUFFER_PIPS}pips")
     logger.info(f"  TP: ネックライン倍返し  SL上限: {MAX_SL_PIPS}pips")
     logger.info(f"  200SMA期間: {SMA_PERIOD}  リトライ: {MAX_RETRY}回")
-    logger.info(f"  ※ ブレイクイーブン廃止（バックテストで悪影響確認済み）")
+    logger.info("  ※ ブレイクイーブン廃止（バックテストで悪影響確認済み）")
     logger.info("=" * 60)
 
     sync_position()
@@ -928,6 +757,49 @@ def run():
             for pos in list(active_positions):
                 pair_name = pos.get("pair", "USD/JPY")
                 ticker    = next((t for t, n in PAIRS.items() if n == pair_name), "USDJPY=X")
+
+                # ── OANDA外部決済チェック（SL/TP/手動がLuce外で執行された場合） ──
+                trade_id = pos.get("trade_id", "")
+                if not DRY_RUN and oanda and trade_id:
+                    try:
+                        td = oanda.get_trade_details(trade_id)
+                        if td.get("state") == "CLOSED":
+                            close_price  = td.get("close_price", pos["entry_price"])
+                            close_reason = td.get("close_reason", "不明")
+                            pnl_pips = (close_price - pos["entry_price"]) * 100 \
+                                       if pos["direction"] == "BUY" \
+                                       else (pos["entry_price"] - close_price) * 100
+                            logger.info(
+                                f"[外部決済検知] {pair_name} {pos['direction']} "
+                                f"@ {pos['entry_price']:.3f} → {close_price:.3f}  "
+                                f"理由:{close_reason}  PnL:{pnl_pips:+.1f}pips"
+                            )
+                            stats = update_stats(pnl_pips, LOT)
+                            oanda_balance = stats["balance"]
+                            try:
+                                acct = oanda.get_account_summary()
+                                oanda_balance = int(acct["nav"])
+                            except Exception:
+                                pass
+                            if LINE_OK:
+                                notify_close(
+                                    direction=pos["direction"],
+                                    entry_price=pos["entry_price"],
+                                    close_price=close_price,
+                                    pnl_pips=pnl_pips,
+                                    reason=close_reason,
+                                    lot=LOT,
+                                    pair=pair_name,
+                                    daily_pips=stats["daily_pips"],
+                                    daily_jpy=stats["daily_jpy"],
+                                    total_pips=stats["total_pips"],
+                                    balance=oanda_balance,
+                                )
+                            remove_position(pos)
+                            continue  # このポジションの残処理はスキップ
+                    except Exception as e:
+                        logger.warning(f"[外部決済チェック] {pair_name} tradeID={trade_id} 確認失敗: {e}")
+
                 try:
                     df_1h, _ = _with_retry(fetch_data, ticker, pair_name,
                                            label=f"fetch {pair_name}")
@@ -984,10 +856,61 @@ def run():
                     continue
 
                 # 全ペア H&S 戦略のみ（EMAクロスは廃止）
-                # バックテスト結果: USD/JPY +1333p, EUR/JPY +1023p, AUD/JPY +2895p
                 signal = check_hs_signal(df_4h)
                 if signal:
                     logger.info(f"[H&S/{pair_name}] {signal['action']}  {signal['reason']}")
+
+                    # ── ① 発注前ライブ価格チェック ────────────────
+                    # 4H足終値でSLを計算するが、実際の発注は現在値で行われる。
+                    # 現在値がすでにSL側に抜けていたらOANDAが即キャンセルするため事前に弾く。
+                    sig_sl  = signal.get("stop_loss")
+                    sig_act = signal["action"]
+                    if sig_sl is not None:
+                        sl_violated = (
+                            (sig_act == "BUY"  and current_price <= sig_sl) or
+                            (sig_act == "SELL" and current_price >= sig_sl)
+                        )
+                        if sl_violated:
+                            logger.info(
+                                f"[SL事前チェック] {pair_name} {sig_act} — "
+                                f"現在値({current_price:.3f})がSL({sig_sl:.3f})を超過 → スキップ"
+                            )
+                            signal = None
+                        else:
+                            # SLまでの距離が近すぎる場合もスキップ（即ストップ回避）
+                            sl_dist_pips = abs(current_price - sig_sl) * 100
+                            if sl_dist_pips < MIN_ENTRY_SL_PIPS:
+                                logger.info(
+                                    f"[SL事前チェック] {pair_name} {sig_act} — "
+                                    f"SLまでの距離({sl_dist_pips:.1f}pips)が最低必要距離"
+                                    f"({MIN_ENTRY_SL_PIPS}pips)未満 → スキップ"
+                                )
+                                signal = None
+
+                if signal:
+                    # ── ② 同一シグナルの連続重複チェック ──────────
+                    sig_key = f"{sig_act}_{signal.get('stop_loss')}_{signal.get('take_profit')}"
+                    cd      = _signal_cooldown.get(pair_name, {})
+                    if cd.get("key") == sig_key:
+                        cd["count"] = cd.get("count", 0) + 1
+                    else:
+                        cd = {"key": sig_key, "count": 1}
+                    _signal_cooldown[pair_name] = cd
+
+                    COOLDOWN_MAX = 6   # 同一シグナルを最大6回（=30分）で停止
+                    if cd["count"] > COOLDOWN_MAX:
+                        logger.info(
+                            f"[クールダウン] {pair_name} — 同一シグナルが{cd['count']}回連続 "
+                            f"({cd['count'] * LOOP_SEC // 60}分) → スキップ"
+                        )
+                        signal = None
+                    elif cd["count"] > 1:
+                        logger.info(
+                            f"[シグナル継続] {pair_name} — 同一シグナル{cd['count']}回目"
+                        )
+                else:
+                    # シグナルなし or 弾かれた → クールダウンリセット
+                    _signal_cooldown.pop(pair_name, None)
 
                 if signal:
                     active_positions = load_positions()

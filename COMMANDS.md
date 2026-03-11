@@ -34,17 +34,18 @@ FX-trade/
 ## 起動・停止
 
 ```bash
-# 通常起動（ターミナルを閉じると止まる）
+# 通常起動（ターミナルを閉じると止まる・ログはコンソールとファイル両方に出る）
 python3 auto_trader.py
 
-# バックグラウンド起動（ターミナルを閉じても動き続ける）
-nohup python3 auto_trader.py > /dev/null 2>&1 &
+# バックグラウンド起動（推奨）
+# caffeinate でMacスリープを防止 / > /dev/null でログ二重書き込みを防止
+caffeinate -i python3 auto_trader.py > /dev/null 2>&1 & disown
 
 # 停止
-kill $(pgrep -f auto_trader.py)
+pkill -f auto_trader
 
-# 動いているか確認
-pgrep -a auto_trader.py
+# 動いているか確認（Macは pgrep -a が効かないため ps を使う）
+ps aux | grep auto_trader | grep -v grep
 ```
 
 ---

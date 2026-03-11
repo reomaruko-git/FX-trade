@@ -19,20 +19,21 @@ backtest.py — FX Trade Luce バックテスト
 
 from __future__ import annotations
 
+import sys
 import argparse
 import warnings
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-import contextlib
-import io
-
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
-from scipy.signal import find_peaks
 
 warnings.filterwarnings("ignore")
+
+# 親ディレクトリの technical.py をインポート
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from technical import _quiet, detect_hs_window
 
 # ─────────────────────────────────────────────────────────────
 # ▌ 設定（auto_trader.py と同じ値）
@@ -65,11 +66,6 @@ RESULTS_DIR = Path(__file__).parent / "backtest_results"
 # ─────────────────────────────────────────────────────────────
 # ▌ ユーティリティ
 # ─────────────────────────────────────────────────────────────
-def _quiet(func, *args, **kwargs):
-    with contextlib.redirect_stdout(io.StringIO()):
-        return func(*args, **kwargs)
-
-
 def _pips(price_diff: float) -> float:
     return round(price_diff * 100, 1)
 
@@ -120,67 +116,19 @@ def calc_sma200(df) -> pd.Series:
 
 def detect_hs_at(df, i, distance=5, tol=0.020):
     """
-    i番目の足時点でのH&Sパターン検知
-    ── run_backtest.py と同じロジックで統一（100本窓・全組み合わせ探索）
+    i番目の足時点でのH&Sパターン検知。
+    コアロジックは technical.detect_hs_window を使用。
+    バックテスト用に rs_idx（元DataFrameでの右肩インデックス）を付加する。
     """
     window_start = max(0, i - 100)
     window = df.iloc[window_start: i + 1]
-    if len(window) < distance * 3:
+    result = detect_hs_window(window, distance=distance, tol=tol)
+    if result is None:
         return None
-    highs = window["High"].values
-    lows  = window["Low"].values
-    n     = len(highs)
-
-    # 天井 H&S → SELL
-    peak_idx, _ = find_peaks(highs, distance=distance)
-    if len(peak_idx) >= 3:
-        for k in range(len(peak_idx) - 3, -1, -1):
-            ls_i = int(peak_idx[k])
-            hd_i = int(peak_idx[k + 1])
-            rs_i = int(peak_idx[k + 2])
-            ls, head, rs = highs[ls_i], highs[hd_i], highs[rs_i]
-
-            if rs_i < n - distance * 4:
-                continue
-            if head <= max(ls, rs):
-                continue
-            if abs(ls - rs) / (head + 1e-9) > tol:
-                continue
-
-            neck1    = float(lows[ls_i:hd_i].min()) if hd_i > ls_i else float(lows[ls_i])
-            neck2    = float(lows[hd_i:rs_i].min()) if rs_i > hd_i else float(lows[hd_i])
-            neckline = (neck1 + neck2) / 2
-            buf      = max(1, distance // 2)
-            rs_high  = float(highs[max(0, rs_i - buf): rs_i + buf + 1].max())
-            return {"pattern": "HEAD_AND_SHOULDERS",
-                    "right_shoulder_high": rs_high, "head": float(head),
-                    "neckline": neckline, "rs_idx": window_start + rs_i}
-
-    # 逆 H&S → BUY
-    trough_idx, _ = find_peaks(-lows, distance=distance)
-    if len(trough_idx) >= 3:
-        for k in range(len(trough_idx) - 3, -1, -1):
-            ls_i = int(trough_idx[k])
-            hd_i = int(trough_idx[k + 1])
-            rs_i = int(trough_idx[k + 2])
-            ls, head, rs = lows[ls_i], lows[hd_i], lows[rs_i]
-
-            if rs_i < n - distance * 4:
-                continue
-            if head >= min(ls, rs):
-                continue
-            if abs(ls - rs) / (abs(head) + 1e-9) > tol:
-                continue
-
-            neck1    = float(highs[ls_i:hd_i].max()) if hd_i > ls_i else float(highs[ls_i])
-            neck2    = float(highs[hd_i:rs_i].max()) if rs_i > hd_i else float(highs[hd_i])
-            neckline = (neck1 + neck2) / 2
-            buf      = max(1, distance // 2)
-            rs_low   = float(lows[max(0, rs_i - buf): rs_i + buf + 1].min())
-            return {"pattern": "INV_HEAD_AND_SHOULDERS",
-                    "right_shoulder_high": float(highs[rs_i]), "right_shoulder_low": rs_low,
-                    "head": float(head), "neckline": neckline, "rs_idx": window_start + rs_i}
-    return None
+    # バックテスト用: 右肩の絶対インデックスを付加
+    rs_i = result.pop("_rs_i", None)
+    result["rs_idx"] = window_start + rs_i if rs_i is not None else -1
+    return result
 
 
 # ─────────────────────────────────────────────────────────────
