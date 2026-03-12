@@ -370,10 +370,14 @@ class OandaExecutor:
         if state == "CLOSED":
             result["close_price"] = float(trade.get("averageClosePrice", 0))
             # 決済理由を推定
-            if trade.get("stopLossOrderID"):
-                result["close_reason"] = "SL"
-            elif trade.get("takeProfitOrderID"):
+            # ※ CLOSED後は stopLossOrderID/takeProfitOrderID が None になるため、
+            #   ネストされた order オブジェクトの state で判定する
+            sl_order = trade.get("stopLossOrder", {})
+            tp_order = trade.get("takeProfitOrder", {})
+            if tp_order.get("state") == "FILLED":
                 result["close_reason"] = "TP"
+            elif sl_order.get("state") == "FILLED":
+                result["close_reason"] = "SL"
             else:
                 result["close_reason"] = "手動"
         return result

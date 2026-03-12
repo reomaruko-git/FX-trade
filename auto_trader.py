@@ -38,6 +38,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import numpy as np
+import pandas_ta  # noqa: F401  — df.ta アクセサの登録に必要（副作用 import）
 from technical import _quiet, detect_hs_window
 
 # ─────────────────────────────────────────────────────────────
